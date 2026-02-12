@@ -1,0 +1,589 @@
+```{r}
+## ============================================================
+## DESeq2 differential expression, enrichment analyses, and figures
+## ============================================================
+##
+## This script performs differential expression analysis (DESeq2) for si-CXXC1
+## across four melanoma cell lines and generates:
+## 1) Per-cell-line DESeq2 results (si-CXXC1 vs si-NTC)
+## 2) Consensus sensitive hits (shared direction across sensitive lines and not
+##    significant in SKMEL28)
+## 3) Volcano plots for each cell line (highlighting consensus hits)
+##    saved under manuscript_out/final_volcano
+## 4) GSEA barplots (Hallmark, KEGG, GO Biological Process) based on a meta-rank
+##    across sensitive lines, saved under manuscript_out/gsea
+## 5) A log2FC heatmap across cell lines for consensus hit genes, ordered by
+##    average sensitive log2FC, saved under manuscript_out/clustermap
+## 6) Hallmark Enrichr barplots for consensus UP and DOWN gene sets (imported
+##    from Enrichr result files) saved under manuscript_out/hallmark_enrichr_barplots
+##
+## Outputs
+## - manuscript_out/gsea/GSEA_Hallmark.pdf
+## - manuscript_out/gsea/GSEA_KEGG.pdf
+## - manuscript_out/gsea/GSEA_GOBP.pdf
+## - manuscript_out/final_volcano/Volcano_Sensitive/Volcano_*.pdf
+## - manuscript_out/final_volcano/Volcano_NonSensitive/Volcano_*.pdf
+## - manuscript_out/clustermap/CXXC1KD_log2FC_clustermap.pdf
+## - manuscript_out/hallmark_enrichr_barplots/barplot_enrichr_upreg.pdf
+## - manuscript_out/hallmark_enrichr_barplots/barplot_enrichr_downreg.pdf
+## ============================================================
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(tibble)
+  library(ggplot2)
+  library(fgsea)
+  library(msigdbr)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(AnnotationDbi)
+  library(GO.db)
+
+  # For Enrichr barplots
+  library(readr)
+  library(forcats)
+  library(scales)
+})
+
+if (!requireNamespace("KEGGREST", quietly = TRUE)) {
+  stop("Package 'KEGGREST' is required for KEGG GSEA. Install it with: install.packages('KEGGREST')")
+}
+if (!requireNamespace("ggrepel", quietly = TRUE)) {
+  stop("Package 'ggrepel' is required for volcano labels. Install it with: install.packages('ggrepel')")
+}
+
+set.seed(1)
+
+## ------------------------------------------------------------
+## Paths
+## ------------------------------------------------------------
+in_counts_rds <- "raw_counts.rds"
+
+out_root       <- "manuscript_out"
+gsea_dir       <- file.path(out_root, "gsea")
+volcano_dir    <- file.path(out_root, "final_volcano")
+clustermap_dir <- file.path(out_root, "clustermap")
+enrichr_outdir <- file.path(out_root, "hallmark_enrichr_barplots")
+
+dir.create(out_root, recursive = TRUE, showWarnings = FALSE)
+dir.create(gsea_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(volcano_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(clustermap_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(enrichr_outdir, recursive = TRUE, showWarnings = FALSE)
+
+dir.create(file.path(volcano_dir, "Volcano_Sensitive"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(volcano_dir, "Volcano_NonSensitive"), recursive = TRUE, showWarnings = FALSE)
+
+## ------------------------------------------------------------
+## Analysis settings
+## ------------------------------------------------------------
+sens_lines <- c("LOXIMVI", "UACC62", "MALME3M")
+ref_line   <- "SKMEL28"
+all_lines  <- c(sens_lines, ref_line)
+
+PADJ_CUTO_DE <- 0.05
+ROW_SUM_PREFILTER <- 10L
+
+## ------------------------------------------------------------
+## Load counts and collapse duplicate Ensembl IDs
+## ------------------------------------------------------------
+counts_raw <- readRDS(in_counts_rds)
+stopifnot(is.matrix(counts_raw) || is.data.frame(counts_raw))
+
+counts_raw <- as.matrix(counts_raw)
+storage.mode(counts_raw) <- "integer"
+
+rn <- rownames(counts_raw)
+stopifnot(!is.null(rn))
+
+spl <- strsplit(rn, "_", fixed = TRUE)
+ens <- vapply(spl, `[`, character(1), 1)
+sym <- vapply(
+  spl,
+  function(x) if (length(x) > 1) paste(x[-1], collapse = "_") else x[1],
+  character(1)
+)
+
+pick_symbol <- function(v) {
+  v <- v[!is.na(v) & nzchar(v)]
+  if (!length(v)) NA_character_ else names(sort(table(v), decreasing = TRUE))[1]
+}
+
+row_map <- data.frame(EnsemblID = ens, GeneName = sym, stringsAsFactors = FALSE)
+
+counts <- rowsum(counts_raw, group = row_map$EnsemblID, reorder = TRUE)
+sym_by_id <- tapply(row_map$GeneName, row_map$EnsemblID, pick_symbol)
+sym_by_id <- sym_by_id[rownames(counts)]
+
+gene_df <- tibble(
+  EnsemblID = rownames(counts),
+  GeneName  = unname(sym_by_id)
+)
+
+rm(counts_raw, rn, spl, ens, sym, row_map, sym_by_id)
+
+## ------------------------------------------------------------
+## Build coldata from sample names and subset to target cell lines
+## ------------------------------------------------------------
+samples <- colnames(counts)
+coldata <- tibble(Sample = samples) %>%
+  mutate(
+    CellLine  = str_match(Sample, paste0("^(", paste(all_lines, collapse = "|"), ")"))[, 2],
+    Treatment = str_match(Sample, "(siNTC|siCXXC1)")[, 1],
+    Rep       = str_match(Sample, "(Rep\\d+)")[, 1]
+  ) %>%
+  filter(!is.na(CellLine), !is.na(Treatment), !is.na(Rep)) %>%
+  mutate(
+    CellLine  = factor(CellLine, levels = all_lines),
+    Treatment = relevel(factor(Treatment, levels = c("siNTC", "siCXXC1")), ref = "siNTC"),
+    Rep       = factor(Rep)
+  )
+
+counts <- counts[, coldata$Sample, drop = FALSE]
+stopifnot(all(coldata$Sample == colnames(counts)))
+
+## ------------------------------------------------------------
+## Prefilter and run DESeq2
+## ------------------------------------------------------------
+keep <- rowSums(counts) >= ROW_SUM_PREFILTER
+counts_f  <- counts[keep, , drop = FALSE]
+gene_df_f <- gene_df[match(rownames(counts_f), gene_df$EnsemblID), , drop = FALSE]
+
+design_formula <- ~ 0 + CellLine + CellLine:Treatment
+dds <- DESeqDataSetFromMatrix(countData = counts_f, colData = coldata, design = design_formula)
+dds <- DESeq(dds)
+
+rnms <- resultsNames(dds)
+
+coef_for_line <- function(line, rnms_vec) {
+  patterns <- c(
+    paste0("^CellLine", line, "\\.TreatmentsiCXXC1$"),
+    paste0("^CellLine", line, ":TreatmentsiCXXC1$"),
+    paste0("CellLine", line, ".*siCXXC1$")
+  )
+  hits <- unique(unlist(lapply(patterns, function(p) grep(p, rnms_vec, value = TRUE))))
+  if (length(hits) != 1) {
+    stop("Could not uniquely identify coefficient for line: ", line, "\nMatches: ", paste(hits, collapse = ", "))
+  }
+  hits[1]
+}
+
+res_per_line <- setNames(vector("list", length(all_lines)), all_lines)
+for (line in all_lines) {
+  coef_name <- coef_for_line(line, rnms)
+  res_per_line[[line]] <- results(
+    dds,
+    name = coef_name,
+    alpha = PADJ_CUTO_DE,
+    independentFiltering = FALSE
+  )
+}
+
+## ------------------------------------------------------------
+## Define consensus sensitive hits (direction-consistent; not significant in SKMEL28)
+## ------------------------------------------------------------
+flag_sig <- function(res_obj, gene_df_map, alpha) {
+  tibble(
+    EnsemblID = rownames(res_obj),
+    padj      = as.numeric(res_obj$padj),
+    lfc       = as.numeric(res_obj$log2FoldChange)
+  ) %>%
+    mutate(
+      GeneName = gene_df_map$GeneName[match(EnsemblID, gene_df_map$EnsemblID)],
+      up   = !is.na(padj) & padj <= alpha & lfc > 0,
+      down = !is.na(padj) & padj <= alpha & lfc < 0
+    ) %>%
+    filter(!is.na(GeneName) & nzchar(GeneName))
+}
+
+M <- lapply(res_per_line, flag_sig, gene_df_map = gene_df_f, alpha = PADJ_CUTO_DE)
+
+sens_up <- Reduce(
+  inner_join,
+  lapply(M[sens_lines], function(x) filter(x, up) %>% select(GeneName))
+) %>% distinct(GeneName) %>% pull(GeneName)
+
+sens_down <- Reduce(
+  inner_join,
+  lapply(M[sens_lines], function(x) filter(x, down) %>% select(GeneName))
+) %>% distinct(GeneName) %>% pull(GeneName)
+
+sk <- M[[ref_line]]
+sk_sig <- sk %>% filter(up | down) %>% pull(GeneName) %>% unique()
+
+sens_up_keep   <- setdiff(sens_up, sk_sig)
+sens_down_keep <- setdiff(sens_down, sk_sig)
+
+## ------------------------------------------------------------
+## Volcano plots (highlight consensus hits; exclude CXXC1 from highlight/labels)
+## ------------------------------------------------------------
+make_volc_tab <- function(res_obj, gene_df_map, cons_up, cons_down) {
+  tibble(
+    EnsemblID   = rownames(res_obj),
+    log2FC_plot = as.numeric(res_obj$log2FoldChange),
+    padj        = as.numeric(res_obj$padj)
+  ) %>%
+    mutate(
+      GeneName = gene_df_map$GeneName[match(EnsemblID, gene_df_map$EnsemblID)]
+    ) %>%
+    filter(!is.na(GeneName) & nzchar(GeneName)) %>%
+    mutate(
+      padj_safe     = ifelse(is.na(padj), 1, pmax(padj, 1e-300)),
+      minusLog10FDR = -log10(padj_safe),
+      consensus_dir = case_when(
+        GeneName %in% cons_up   ~ "cons_up",
+        GeneName %in% cons_down ~ "cons_down",
+        TRUE ~ "none"
+      )
+    )
+}
+
+volc_tabs <- setNames(vector("list", length(all_lines)), all_lines)
+for (line in all_lines) {
+  volc_tabs[[line]] <- make_volc_tab(res_per_line[[line]], gene_df_f, sens_up_keep, sens_down_keep)
+}
+
+cap_y <- function(df, y_col = "minusLog10FDR", cap = 100) {
+  df %>%
+    mutate(
+      y_plot  = pmin(.data[[y_col]], cap),
+      y_label = ifelse(.data[[y_col]] > cap, paste0(">=", cap), as.character(.data[[y_col]]))
+    )
+}
+
+plot_volcano <- function(tab, line, x_lim, outdir_sub, y_cap = 100) {
+  tab <- cap_y(tab, y_col = "minusLog10FDR", cap = y_cap)
+
+  grey_df  <- filter(tab, consensus_dir == "none")
+  color_df <- filter(tab, consensus_dir != "none" & GeneName != "CXXC1")
+
+  p <- ggplot() +
+    geom_point(
+      data = grey_df,
+      aes(x = log2FC_plot, y = y_plot),
+      color = "grey80", alpha = 0.4, size = 0.8, stroke = 0.1
+    ) +
+    geom_point(
+      data = color_df,
+      aes(x = log2FC_plot, y = y_plot, fill = consensus_dir),
+      shape = 21, color = "black", size = 0.8, alpha = 0.75, stroke = 0.1
+    ) +
+    scale_fill_manual(values = c(cons_up = "#9C7CFC", cons_down = "#85D484"), guide = "none") +
+    geom_hline(yintercept = -log10(PADJ_CUTO_DE), linetype = "dashed", linewidth = 0.3) +
+    scale_x_continuous(limits = c(-x_lim, x_lim), expand = expansion(mult = 0.02)) +
+    scale_y_continuous(
+      limits = c(0, y_cap), expand = expansion(mult = 0.02),
+      breaks = c(0, 25, 50, 75, 100),
+      labels = c(0, 25, 50, 75, ">=100")
+    ) +
+    labs(
+      title = "",
+      x = "log2 fold change (MLE)",
+      y = expression(-log[10]("FDR"))
+    ) +
+    theme_classic(base_size = 3)
+
+  ggsave(
+    filename = file.path(outdir_sub, paste0("Volcano_", line, ".pdf")),
+    plot     = p,
+    width    = 1,
+    height   = 1,
+    dpi      = 300
+  )
+
+  p
+}
+
+nonsensitive_lines <- setdiff(all_lines, sens_lines)
+
+for (line in sens_lines) {
+  tab <- volc_tabs[[line]]
+  x_lim <- ceiling(max(abs(tab$log2FC_plot), na.rm = TRUE) * 1.05 * 10) / 10
+  plot_volcano(tab, line, x_lim, file.path(volcano_dir, "Volcano_Sensitive"))
+}
+
+for (line in nonsensitive_lines) {
+  tab <- volc_tabs[[line]]
+  x_lim <- ceiling(max(abs(tab$log2FC_plot), na.rm = TRUE) * 1.05 * 10) / 10
+  plot_volcano(tab, line, x_lim, file.path(volcano_dir, "Volcano_NonSensitive"))
+}
+
+## ------------------------------------------------------------
+## GSEA meta-rank across sensitive lines (Wald statistic)
+## ------------------------------------------------------------
+add_gene_names <- function(res_obj, gene_df_map) {
+  out <- as.data.frame(res_obj)
+  out$EnsemblID <- rownames(res_obj)
+  out$GeneName  <- gene_df_map$GeneName[match(out$EnsemblID, gene_df_map$EnsemblID)]
+  out <- out %>% as_tibble() %>% relocate(GeneName, EnsemblID)
+  out
+}
+
+get_ranks_symbol <- function(res_obj, gene_df_map) {
+  df <- add_gene_names(res_obj, gene_df_map) %>%
+    filter(!is.na(stat), !is.na(GeneName), nzchar(GeneName)) %>%
+    distinct(GeneName, .keep_all = TRUE)
+
+  r <- df$stat
+  names(r) <- df$GeneName
+  r
+}
+
+ranks_list <- lapply(res_per_line[sens_lines], get_ranks_symbol, gene_df_map = gene_df_f)
+common_genes <- Reduce(intersect, lapply(ranks_list, names))
+ranks_meta <- rowMeans(sapply(ranks_list, function(x) x[common_genes]), na.rm = TRUE)
+names(ranks_meta) <- common_genes
+ranks_meta <- sort(ranks_meta, decreasing = TRUE)
+
+symbol_to_entrez <- function(genes) {
+  bitr(genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db) %>%
+    distinct(SYMBOL, .keep_all = TRUE)
+}
+
+entrez_df <- symbol_to_entrez(names(ranks_meta))
+ranks_entrez <- ranks_meta[entrez_df$SYMBOL]
+names(ranks_entrez) <- entrez_df$ENTREZID
+ranks_entrez <- sort(ranks_entrez, decreasing = TRUE)
+
+## Hallmark
+msig_h <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  select(gs_name, entrez_gene)
+path_hallmark <- split(msig_h$entrez_gene, msig_h$gs_name)
+
+gsea_hallmark <- fgsea(
+  pathways = path_hallmark,
+  stats    = ranks_entrez,
+  minSize  = 15,
+  maxSize  = 500,
+  nperm    = 10000
+) %>% arrange(padj)
+
+## KEGG
+kegg_path <- KEGGREST::keggList("pathway", "hsa")
+kegg_ids  <- names(kegg_path)
+
+kegg_genes <- lapply(kegg_ids, function(pid) {
+  kg <- KEGGREST::keggGet(pid)
+  if (is.null(kg[[1]]$GENE)) return(NULL)
+  genes <- kg[[1]]$GENE[seq(1, length(kg[[1]]$GENE), 2)]
+  as.character(genes)
+})
+names(kegg_genes) <- unname(kegg_path)
+kegg_genes <- kegg_genes[!vapply(kegg_genes, is.null, logical(1))]
+
+gsea_kegg <- fgsea(
+  pathways = kegg_genes,
+  stats    = ranks_entrez,
+  minSize  = 10,
+  maxSize  = 800,
+  nperm    = 10000
+) %>% arrange(padj)
+
+## GO:BP
+go_bp_raw <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys    = names(ranks_entrez),
+  keytype = "ENTREZID",
+  columns = c("GO", "ONTOLOGY")
+) %>%
+  filter(ONTOLOGY == "BP", !is.na(GO))
+
+go_bp_pathways <- go_bp_raw %>%
+  group_by(GO) %>%
+  summarise(genes = list(ENTREZID), .groups = "drop")
+
+go_bp_list <- setNames(go_bp_pathways$genes, go_bp_pathways$GO)
+
+gsea_go_bp <- fgsea(
+  pathways = go_bp_list,
+  stats    = ranks_entrez,
+  minSize  = 10,
+  maxSize  = 800,
+  nperm    = 10000
+) %>% arrange(padj)
+
+lookup_go_term <- function(go_id) {
+  obj <- GOTERM[[go_id]]
+  if (is.null(obj)) return(NA_character_)
+  Term(obj)
+}
+
+gsea_go_bp2 <- gsea_go_bp %>%
+  mutate(
+    pathway_clean = vapply(pathway, lookup_go_term, FUN.VALUE = character(1)),
+    pathway_clean = ifelse(is.na(pathway_clean), pathway, pathway_clean)
+  )
+
+plot_gsea_barplot <- function(gsea_tbl, title, q_cut = 0.05) {
+  df <- gsea_tbl %>% filter(padj <= q_cut)
+  if (nrow(df) == 0) return(NULL)
+
+  if (title == "Hallmark") {
+    df <- df %>%
+      mutate(pathway_clean = pathway %>%
+               str_remove("^HALLMARK_") %>%
+               str_replace_all("_", " ") %>%
+               str_to_title())
+  } else if (title == "KEGG") {
+    df <- df %>%
+      mutate(pathway_clean = pathway %>% str_remove(" - Homo sapiens \\(human\\)"))
+  } else {
+    if (!("pathway_clean" %in% names(df))) df$pathway_clean <- df$pathway
+  }
+
+  df <- df %>%
+    mutate(
+      dir  = NES > 0,
+      Path = forcats::fct_reorder(pathway_clean, NES) %>% forcats::fct_rev()
+    )
+
+  ggplot(df, aes(x = Path, y = NES, fill = dir)) +
+    geom_col(color = "black") +
+    coord_flip() +
+    scale_fill_manual(values = c(`TRUE` = "#9C7CFC", `FALSE` = "#85D484")) +
+    theme_classic(base_size = 10) +
+    labs(title = title, y = "NES", x = NULL) +
+    theme(legend.position = "none")
+}
+
+p_h <- plot_gsea_barplot(gsea_hallmark, "Hallmark")
+if (!is.null(p_h)) ggsave(file.path(gsea_dir, "GSEA_Hallmark.pdf"), p_h, width = 3, height = 4, units = "in")
+
+p_k <- plot_gsea_barplot(gsea_kegg, "KEGG")
+if (!is.null(p_k)) ggsave(file.path(gsea_dir, "GSEA_KEGG.pdf"), p_k, width = 5, height = 6, units = "in")
+
+p_bp <- plot_gsea_barplot(gsea_go_bp2, "GO:BP")
+if (!is.null(p_bp)) ggsave(file.path(gsea_dir, "GSEA_GOBP.pdf"), p_bp, width = 6, height = 10, units = "in")
+
+## ------------------------------------------------------------
+## Clustermap: log2FC heatmap across cell lines (consensus hits)
+## ------------------------------------------------------------
+hit_genes <- unique(c(sens_up_keep, sens_down_keep))
+hit_genes <- hit_genes[!is.na(hit_genes) & nzchar(hit_genes)]
+if (length(hit_genes) == 0) stop("Consensus hit list is empty.")
+
+add_gene_names_for_heatmap <- function(res_obj, gene_df_map) {
+  tibble(
+    EnsemblID = rownames(res_obj),
+    log2FC    = as.numeric(res_obj$log2FoldChange)
+  ) %>%
+    mutate(GeneName = gene_df_map$GeneName[match(EnsemblID, gene_df_map$EnsemblID)]) %>%
+    filter(!is.na(GeneName) & nzchar(GeneName)) %>%
+    group_by(GeneName) %>%
+    summarise(log2FC = mean(log2FC, na.rm = TRUE), .groups = "drop")
+}
+
+lfc_long <- bind_rows(lapply(all_lines, function(line) {
+  add_gene_names_for_heatmap(res_per_line[[line]], gene_df_f) %>%
+    filter(GeneName %in% hit_genes) %>%
+    mutate(CellLine = line)
+}))
+
+gene_order <- lfc_long %>%
+  filter(CellLine %in% sens_lines) %>%
+  group_by(GeneName) %>%
+  summarise(mean_log2FC_sens = mean(log2FC, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(mean_log2FC_sens)) %>%
+  pull(GeneName)
+
+lfc_long <- lfc_long %>%
+  mutate(
+    CellLine = factor(CellLine, levels = all_lines),
+    GeneName = factor(GeneName, levels = rev(gene_order))
+  )
+
+lim <- stats::quantile(abs(lfc_long$log2FC), 0.98, na.rm = TRUE)
+lim <- ifelse(is.finite(lim) && lim > 0, lim, 1)
+
+p_heat <- ggplot(lfc_long, aes(x = CellLine, y = GeneName, fill = log2FC)) +
+  geom_tile() +
+  scale_fill_gradient2(
+    low = "#85D484",
+    mid = "white",
+    high = "#9C7CFC",
+    midpoint = 0,
+    limits = c(-lim, lim),
+    name = expression(log[2]~"fold change\n(si-CXXC1/si-NTC)")
+  ) +
+  labs(
+    title = "Significantly up/down regulated genes in CXXC1-dependent cell lines",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_classic(base_size = 10) +
+  theme(
+    axis.text.x  = element_text(angle = 45, hjust = 1, vjust = 1),
+    axis.text.y  = element_blank(),
+    axis.ticks.y = element_blank(),
+    plot.title   = element_text(hjust = 0.5,
+    legend.position = "none")
+  )
+
+ggsave(
+  filename = file.path(clustermap_dir, "CXXC1KD_log2FC_clustermap.pdf"),
+  plot     = p_heat,
+  width    = 2.0,
+  height   = 2.2,
+  units    = "in"
+)
+
+## ------------------------------------------------------------
+## Hallmark EnrichR barplots (import two files; make two PDFs)
+## ------------------------------------------------------------
+## CONFIG: update these paths (can be absolute or relative)
+FN1 <- "Hits_Sensitive_DOWN_notSKMEL28_enrichr.csv"
+FN2 <- "Hits_sensitive_UP_notSKMEL28_enrichr.csv"
+
+plot_hallmark_bar <- function(df, plot_title, out_file = NULL) {
+  # Expect at least 'term' and 'q.value'
+  stopifnot(all(c("term", "q.value") %in% names(df)))
+
+  fill_color <- ifelse(plot_title %in% c("Upregulated"), "#9C7CFC", "#84D484")
+
+  df_filt <- df %>%
+    filter(`q.value` <= 0.05) %>%
+    mutate(
+      term = gsub("\\s*\\(GO:.*\\)$", "", term),
+      term = gsub("^HALLMARK_", "", term),
+      term = gsub("_", " ", term),
+      neg_log10_q = -log10(`q.value`),
+      term = fct_reorder(term, neg_log10_q)
+    )
+
+  if (nrow(df_filt) == 0) {
+    stop("No terms with q-value <= 0.05 found.")
+  }
+
+  max_neglog <- max(df_filt$neg_log10_q, na.rm = TRUE)
+
+  p <- ggplot(df_filt, aes(x = term, y = neg_log10_q)) +
+    geom_col(fill = fill_color, color = "black", width = 1) +
+    expand_limits(y = max_neglog * 1.25) +
+    coord_flip() +
+    theme_classic(base_size = 7) +
+    labs(
+      x = NULL,
+      y = expression(-log[10]("FDR")),
+      title = ""
+    ) +
+    theme(axis.title.y = element_blank()) +
+    scale_y_continuous(expand = c(0, 0))
+
+  if (!is.null(out_file)) {
+    ggsave(file.path(enrichr_outdir, out_file), p, width = 3, height = 1.5)
+  }
+  p
+}
+
+hallmark1 <- read.csv(FN1)
+hallmark2 <- read.csv(FN2)
+
+plot_hallmark_bar(hallmark1, plot_title = "Downregulated", out_file = "barplot_enrichr_downreg.pdf")
+plot_hallmark_bar(hallmark2, plot_title = "Upregulated",   out_file = "barplot_enrichr_upreg.pdf")
+
+message("DONE. Outputs saved to:\n  ", gsea_dir, "\n  ", volcano_dir, "\n  ", clustermap_dir, "\n  ", enrichr_outdir)
+
+```
