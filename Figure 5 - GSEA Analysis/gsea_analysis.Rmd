@@ -1,0 +1,328 @@
+```{r}
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+  library(tibble)
+  library(stringr)
+  library(msigdbr)
+  library(org.Hs.eg.db)
+  library(clusterProfiler)
+  library(fgsea)
+  library(ggplot2)
+})
+
+set.seed(42)
+
+# ============================================================
+# Paths
+# ============================================================
+FILE_MRNA <- "Melanoma_OmicsExpressionProteinCodingGenesTPMLog1.csv"
+FILE_DEP  <- "CRISPRGeneDependency_nonEpiGenes.csv"
+FILE_PLS  <- "2025_Melanoma_EpiGene_Dependency_GaussianClasses.csv"
+
+OUT_DIR <- "manuscript_out"
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# ============================================================
+# Parameters
+# ============================================================
+method_cor   <- "spearman"
+fdr_gray_cut <- 0.10
+minSize      <- 15
+maxSize      <- 500
+
+# Set1/COMPASS subunits used to compute the phenotype score
+set1compass_genes <- c("CXXC1","SETD1B","SETD1A","ASH2L","DPY30","RBBP5","WDR5","WDR82")
+
+# ============================================================
+# Load mRNA (rows = cell lines; cols = genes)
+# ============================================================
+mrna_raw <- read_csv(FILE_MRNA, show_col_types = FALSE)
+
+mrna_id_col <- intersect(c("Cell Line", "Cell.Line", "CellLine"), names(mrna_raw))[1]
+if (is.na(mrna_id_col)) stop("Could not find a cell-line column in the mRNA file.")
+
+mrna_expression <- mrna_raw %>%
+  mutate(.cell = as.character(.data[[mrna_id_col]])) %>%
+  select(-all_of(intersect(c(mrna_id_col, "X", "...1"), names(mrna_raw)))) %>%
+  column_to_rownames(".cell") %>%
+  select(where(is.numeric)) %>%
+  as.data.frame()
+
+# ============================================================
+# Load dependency (rows = cell lines; cols = genes)
+# ============================================================
+dep_raw <- read_csv(FILE_DEP, show_col_types = FALSE)
+
+dep_id_col <- intersect(c("CellLine", "DepMap_ID", "ModelID", "Model.Id"), names(dep_raw))[1]
+if (is.na(dep_id_col)) stop("Could not find a cell-line column in the dependency file.")
+
+gene_dependency <- dep_raw %>%
+  mutate(.cell = as.character(.data[[dep_id_col]])) %>%
+  select(-all_of(intersect(c(dep_id_col, "DepMap_ID", "ModelID", "Model.Id"), names(dep_raw)))) %>%
+  column_to_rownames(".cell") %>%
+  select(where(is.numeric)) %>%
+  as.data.frame()
+
+# ============================================================
+# Load curated PLS-DA cohort (cell line list only)
+# ============================================================
+pls_raw <- read_csv(FILE_PLS, show_col_types = FALSE)
+
+pls_id_col <- intersect(c("CellLine", "Cell Line", "Cell.Line"), names(pls_raw))[1]
+if (is.na(pls_id_col)) stop("Could not find a cell-line column in the PLS-DA file.")
+
+cells_pls <- pls_raw[[pls_id_col]] %>% as.character() %>% unique()
+
+# ============================================================
+# Shared cell lines (restrict all matrices to same cohort)
+# ============================================================
+cells <- Reduce(intersect, list(rownames(mrna_expression), rownames(gene_dependency), cells_pls))
+if (length(cells) == 0) stop("No shared cell lines across mRNA, dependency, and PLS-DA cohort.")
+
+mrna_expression <- mrna_expression[cells, , drop = FALSE]
+gene_dependency <- gene_dependency[cells, , drop = FALSE]
+
+# ============================================================
+# Phenotype definition: Set1/COMPASS dependency score
+# (row-wise mean across Set1/COMPASS subunits)
+# ============================================================
+set1compass_score <- rowMeans(gene_dependency[, set1compass_genes, drop = FALSE], na.rm = TRUE)
+
+# ============================================================
+# Hallmark gene sets (Entrez IDs)
+# ============================================================
+h_term2gene <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  select(gs_name, entrez_gene)
+
+h_pathways <- split(h_term2gene$entrez_gene, h_term2gene$gs_name) %>%
+  lapply(unique)
+
+# Pretty pathway names for plotting
+pretty_hallmark <- function(x) {
+  x %>%
+    str_replace("^HALLMARK_", "") %>%
+    str_replace_all("_", " ") %>%
+    str_to_lower() %>%
+    str_to_title()
+}
+
+# ============================================================
+# Helpers: SYMBOL -> ENTREZ mapping and ranking construction
+# ============================================================
+make_symbol2entrez_map <- function(symbols) {
+  suppressMessages(
+    bitr(symbols, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+  ) %>%
+    distinct(SYMBOL, ENTREZID) %>%
+    group_by(SYMBOL) %>%
+    slice(1) %>%          # collapse 1:many SYMBOL->ENTREZ to a single mapping
+    ungroup()
+}
+
+make_gene_ranking <- function(mat_df, phenotype, method = "spearman") {
+  X <- as.matrix(mat_df)
+
+  # Minimal guardrails so cor() never sees empty vectors
+  if (nrow(X) == 0 || ncol(X) == 0) stop("Ranking matrix has 0 rows or 0 columns after filtering.")
+  if (length(phenotype) != nrow(X)) stop("Phenotype length does not match number of rows in matrix.")
+  if (all(is.na(phenotype))) stop("Phenotype is all NA after alignment.")
+
+  # Correlate each feature with phenotype (rank statistic = correlation)
+  stats <- apply(X, 2, function(x) suppressWarnings(
+    cor(x, phenotype, method = method, use = "pairwise.complete.obs")
+  ))
+
+  stats <- stats[is.finite(stats)]
+  stats
+}
+
+collapse_to_entrez <- function(stats_sym, conv_df) {
+  # Join SYMBOL-level statistics to ENTREZ and collapse duplicates by max |stat|
+  df <- tibble(SYMBOL = names(stats_sym), stat = as.numeric(stats_sym)) %>%
+    inner_join(conv_df, by = "SYMBOL") %>%
+    group_by(ENTREZID) %>%
+    slice_max(order_by = abs(stat), n = 1, with_ties = FALSE) %>%
+    ungroup()
+
+  out <- df$stat
+  names(out) <- df$ENTREZID
+
+  # Break ties deterministically (fgsea requires unique ranks)
+  set.seed(1)
+  out <- out + rnorm(length(out), mean = 0, sd = 1e-8)
+
+  sort(out, decreasing = TRUE)
+}
+
+run_fgsea <- function(stats_entrez, pathways_list, minSize = 15, maxSize = 500, eps = 1e-50) {
+  fgseaMultilevel(
+    pathways = pathways_list,
+    stats    = stats_entrez,
+    minSize  = minSize,
+    maxSize  = maxSize,
+    eps      = eps
+  ) %>%
+    as.data.frame() %>%
+    arrange(padj, desc(abs(NES)))
+}
+
+# ============================================================
+# Plotting helper: show all Hallmark pathways as a bar chart
+# ============================================================
+plot_hallmark_all <- function(res_df,
+                              title = NULL,
+                              ylab  = "NES (Hallmark; ranked genes)",
+                              fdr_gray_cut = 0.10,
+                              order_mode = c("NES", "alphabetical"),
+                              pos_col = "#9C7CFC",
+                              neg_col = "#84D484",
+                              nonsig_col = "gray90") {
+
+  order_mode <- match.arg(order_mode)
+
+  # Format for plotting
+  plot_tbl <- res_df %>%
+    mutate(
+      pathway_pretty = pretty_hallmark(pathway),
+      label          = paste0("FDR=", signif(padj, 2)),
+      sig            = !is.na(padj) & padj <= fdr_gray_cut,
+      fill_group     = case_when(
+        !sig    ~ "nonsig",
+        NES > 0 ~ "pos",
+        TRUE    ~ "neg"
+      )
+    )
+
+  # Pathway ordering: by NES or alphabetical
+  if (order_mode == "NES") {
+    plot_tbl <- plot_tbl %>% arrange(NES)
+    plot_tbl$pathway_pretty <- factor(plot_tbl$pathway_pretty, levels = plot_tbl$pathway_pretty)
+  } else {
+    plot_tbl <- plot_tbl %>% arrange(pathway_pretty)
+    # After coord_flip(), reversing puts A at the top
+    plot_tbl$pathway_pretty <- factor(plot_tbl$pathway_pretty, levels = rev(plot_tbl$pathway_pretty))
+  }
+
+  # Plot
+  p <- ggplot(plot_tbl, aes(x = pathway_pretty, y = NES, fill = fill_group)) +
+    geom_col(color = "black", width = 1) +
+    coord_flip() +
+    geom_text(
+      aes(label = label),
+      hjust = ifelse(plot_tbl$NES > 0, -0.15, 1.15),
+      size  = 3
+    ) +
+    scale_fill_manual(values = c(pos = pos_col, neg = neg_col, nonsig = nonsig_col), guide = "none") +
+    theme_classic(base_size = 10) +
+    theme(axis.text.y = element_text(size = 7)) +
+    labs(x = NULL, y = ylab, title = title) +
+    expand_limits(y = max(abs(plot_tbl$NES), na.rm = TRUE) * 1.15)
+
+  list(plot = p, table = plot_tbl)
+}
+
+# ============================================================
+# GSEA wrapper: run Hallmark fgsea + return two plot orderings
+# ============================================================
+gsea_hallmark_set1compass <- function(mat_df, phenotype, label,
+                                      method = "spearman",
+                                      fdr_gray_cut = 0.10,
+                                      minSize = 15, maxSize = 500) {
+
+  # Map feature symbols to Entrez IDs (Hallmark sets use Entrez)
+  conv <- make_symbol2entrez_map(colnames(mat_df))
+
+  # Build gene ranking (feature-wise correlation with phenotype)
+  stats_sym <- make_gene_ranking(mat_df, phenotype, method = method)
+
+  # Convert to Entrez-ranked statistic vector
+  stats_ent <- collapse_to_entrez(stats_sym, conv)
+
+  # Run fgsea
+  res <- run_fgsea(stats_ent, h_pathways, minSize = minSize, maxSize = maxSize)
+
+  # Plot: ordered by NES
+  out_nes <- plot_hallmark_all(
+    res_df = res,
+    title = paste0(label, " (ordered by NES)"),
+    ylab  = paste0("NES (Hallmark; ", method, " ranked genes; ", label, ")"),
+    fdr_gray_cut = fdr_gray_cut,
+    order_mode = "NES"
+  )
+
+  # Plot: alphabetical
+  out_alpha <- plot_hallmark_all(
+    res_df = res,
+    title = paste0(label, " (alphabetical)"),
+    ylab  = paste0("NES (Hallmark; ", method, " ranked genes; ", label, ")"),
+    fdr_gray_cut = fdr_gray_cut,
+    order_mode = "alphabetical"
+  )
+
+  list(
+    label = label,
+    results = res,
+    stats_entrez = stats_ent,
+    plot_nes = out_nes$plot,
+    plot_alpha = out_alpha$plot,
+    table_nes = out_nes$table,
+    table_alpha = out_alpha$table
+  )
+}
+
+# ============================================================
+# Run Hallmark GSEA: Set1/COMPASS (mRNA and dependency)
+# ============================================================
+
+# mRNA: gene expression correlates with Set1/COMPASS dependency score
+mrna_gsea <- gsea_hallmark_set1compass(
+  mat_df     = mrna_expression,
+  phenotype  = set1compass_score,
+  label      = "mRNA ~ Set1/COMPASS dependency",
+  method     = method_cor,
+  fdr_gray_cut = fdr_gray_cut,
+  minSize    = minSize,
+  maxSize    = maxSize
+)
+
+# Dependency: genome-wide dependency correlates with Set1/COMPASS dependency score
+# (drop Set1/COMPASS subunits from the features to avoid trivial self-correlation)
+dep_features <- gene_dependency[, setdiff(colnames(gene_dependency), set1compass_genes), drop = FALSE]
+
+dep_gsea <- gsea_hallmark_set1compass(
+  mat_df     = dep_features,
+  phenotype  = set1compass_score,
+  label      = "Dependency ~ Set1/COMPASS dependency",
+  method     = method_cor,
+  fdr_gray_cut = fdr_gray_cut,
+  minSize    = minSize,
+  maxSize    = maxSize
+)
+
+# ============================================================
+# Save results tables
+# ============================================================
+write_csv(mrna_gsea$results, file.path(OUT_DIR, "gsea_hallmark_mRNA_Set1COMPASS.csv"))
+write_csv(dep_gsea$results,  file.path(OUT_DIR, "gsea_hallmark_Dependency_Set1COMPASS.csv"))
+
+# ============================================================
+# Save plots: ordered by NES + alphabetical
+# ============================================================
+pdf(file.path(OUT_DIR, "gsea_hallmark_mRNA_Set1COMPASS_ordered_by_NES.pdf"), width = 6.5, height = 6)
+print(mrna_gsea$plot_nes)
+dev.off()
+
+pdf(file.path(OUT_DIR, "gsea_hallmark_mRNA_Set1COMPASS_alphabetical.pdf"), width = 6.5, height = 6)
+print(mrna_gsea$plot_alpha)
+dev.off()
+
+pdf(file.path(OUT_DIR, "gsea_hallmark_Dependency_Set1COMPASS_ordered_by_NES.pdf"), width = 6.5, height = 6)
+print(dep_gsea$plot_nes)
+dev.off()
+
+pdf(file.path(OUT_DIR, "gsea_hallmark_Dependency_Set1COMPASS_alphabetical.pdf"), width = 6.5, height = 6)
+print(dep_gsea$plot_alpha)
+dev.off()
+```
+
