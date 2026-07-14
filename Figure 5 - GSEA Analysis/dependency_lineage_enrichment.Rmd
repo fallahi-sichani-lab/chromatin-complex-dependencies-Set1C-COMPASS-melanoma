@@ -1,0 +1,586 @@
+```{r setup}
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(ggplot2)
+  library(ggrepel)
+  library(data.table)
+  library(readxl)
+  library(tibble)
+  library(scales)
+  library(msigdbr)
+  library(org.Hs.eg.db)
+  library(clusterProfiler)
+  library(fgsea)
+})
+
+set.seed(42)
+
+IN_DIR   <- "."
+IN_ROOT  <- "manuscript_out"
+OUT_DIR  <- file.path(IN_ROOT, "FigS4")
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+FIG1A_FILE     <- file.path("limma_complex_cellline_one_vs_rest.csv")
+LINEAGE_FILE   <- file.path("cellline_lineage_assignment.csv")
+FN_EPI         <- file.path(IN_DIR, "EpiGenes_main.xlsx")
+
+if (!file.exists(FIG1A_FILE)) {
+  stop("Missing ", FIG1A_FILE, " -- run complex_dependency_analysis.Rmd first ",
+       "so this script can import its exact limma output rather than re-fitting it.")
+}
+if (!file.exists(LINEAGE_FILE)) {
+  stop("Missing ", LINEAGE_FILE, " -- run the updated complex_dependency_analysis.Rmd ",
+       "first (it now exports the exact CellLine->Lineage table used for Figure 1A).")
+}
+
+hallmark_names <- c(
+  "HALLMARK_MYC_TARGETS_V1",
+  "HALLMARK_MYC_TARGETS_V2",
+  "HALLMARK_OXIDATIVE_PHOSPHORYLATION",
+  "HALLMARK_E2F_TARGETS",
+  "HALLMARK_DNA_REPAIR"
+)
+
+hallmark_labels <- c(
+  "HALLMARK_MYC_TARGETS_V1"            = "MYC Targets V1",
+  "HALLMARK_MYC_TARGETS_V2"            = "MYC Targets V2",
+  "HALLMARK_OXIDATIVE_PHOSPHORYLATION" = "OXPHOS",
+  "HALLMARK_E2F_TARGETS"               = "E2F Targets",
+  "HALLMARK_DNA_REPAIR"                = "DNA Repair"
+)
+
+# ------------------------------------------------------------
+# IMPORTANT: fig1A_raw and epi_map use DIFFERENT naming conventions for
+# the same complex, confirmed empirically:
+#   - fig1A_raw$Complex   (the heatmap's own display label): "SET1C/COMPASS"
+#   - epi_map$Complex     (raw EpiGenes_main.xlsx label):     "COMPASS"
+#     (epi_map also has separate "COMPASS-like MLL1" / "COMPASS-like MLL3"
+#     entries for the KMT2A/KMT2C-based complexes -- NOT this one)
+# These MUST be two separate constants. Reusing a single
+# SET1C_COMPLEX_NAME for both filters is what silently produced a 0-row
+# fig1A_set1c/set1compass_genes earlier (no error -- just an empty filter).
+# ------------------------------------------------------------
+SET1C_COMPLEX_NAME_FIG1A <- "SET1C/COMPASS"   # matches fig1A_raw$Complex
+SET1C_COMPLEX_NAME_EPI   <- "COMPASS"          # matches epi_map$Complex
+
+MELANOMA_ABBREV <- "MEL"
+
+MIN_PER_LINEAGE <- 5   # same GSEA per-lineage minimum used throughout
+
+method_cor <- "spearman"
+minSize    <- 15
+maxSize    <- 500
+
+# ------------------------------------------------------------
+# Heatmap-matching color scale (ZLIM/palette ported directly from
+# complex_dependency_analysis.Rmd) so dot fill below is on the SAME
+# variable (Z-scored mean dependency) AND the same white -> white ->
+# turquoise mapping/limits as the Fig 1A heatmap -- a dot's shade is
+# then directly comparable to that lineage's Set1C/COMPASS cell
+# color in the heatmap, not just similar in hue.
+# ------------------------------------------------------------
+HEATMAP_ZLIM   <- 5
+HEATMAP_COLORS <- c("white", "white", "#00ACC1")
+# IMPORTANT: ggplot2's scale_fill_gradientn() interpolates colors in Lab space
+# by default (and, as of recent `scales` versions, this can no longer be
+# switched off via space="rgb" -- that argument is deprecated/locked to Lab).
+# pheatmap/colorRampPalette() (used for the heatmap) interpolates in raw RGB
+# space. Same endpoints, same limits, but a DIFFERENT interpolation path in
+# between -- this is what was making the dot-plot colors visibly lighter
+# than the heatmap's for the same Z-value (confirmed: Z=0.98 renders as
+# RGB(205,238,242) in the heatmap vs RGB(219,239,243) via naive 3-stop
+# gradientn -- a real, measurable discrepancy, not a visual illusion).
+#
+# Fix: pre-compute the SAME dense RGB-interpolated palette the heatmap uses,
+# and hand ggplot the whole vector rather than just 3 endpoints. ggplot then
+# only Lab-interpolates between adjacent, near-identical stops, making the
+# residual error negligible (verified to match within 1 RGB unit).
+HEATMAP_PAL_FULL <- colorRampPalette(HEATMAP_COLORS)(201)
+
+# Same abbreviation table used in complex_dependency_analysis.Rmd, so Fig 1A's
+# "Lineage" (full OncoTree names) map onto the same abbreviations used as
+# "Lineage" in the per-lineage GSEA output below.
+abbrev_map <- c(
+  "Acute myeloid leukemia" = "AML",
+  "Ampullary carcinoma" = "AMP",
+  "Anaplastic thyroid cancer" = "ATC",
+  "B-cell acute lymphoblastic leukemia" = "B-ALL",
+  "Bladder urothelial carcinoma" = "BLAD",
+  "Cervical squamous cell carcinoma" = "CESC",
+  "Colorectal adenocarcinoma" = "CRC",
+  "Cutaneous squamous cell carcinoma" = "cSCC",
+  "Diffuse glioma" = "GLIO",
+  "Embryonal tumor" = "EMB",
+  "Endometrial carcinoma" = "ENDO",
+  "Esophageal squamous cell carcinoma" = "ESCC",
+  "Esophagogastric adenocarcinoma" = "EGA",
+  "Ewing sarcoma" = "EWS",
+  "Head and neck squamous cell carcinoma" = "HNSC",
+  "Hepatocellular carcinoma" = "LIHC",
+  "Intracholecystic papillary neoplasm" = "ICPN",
+  "Intraductal papillary neoplasm of the bile duct" = "IPNB",
+  "Invasive breast carcinoma" = "BRCA",
+  "Liposarcoma" = "LIPO",
+  "Lung neuroendocrine tumor" = "LNET",
+  "Mature b-cell neoplasms" = "MBN",
+  "Mature t and nk neoplasms" = "MTNK",
+  "Melanoma" = "MEL",
+  "Myeloproliferative neoplasms" = "MPN",
+  "Nerve sheath tumor" = "NST",
+  "Neuroblastoma" = "NB",
+  "Non-hodgkin lymphoma" = "NHL",
+  "Non-seminomatous germ cell tumor" = "NSGCT",
+  "Non-small cell lung cancer" = "NSCLC",
+  "Ocular melanoma" = "OCM",
+  "Osteosarcoma" = "OSTEO",
+  "Ovarian epithelial tumor" = "OV",
+  "Pancreatic adenocarcinoma" = "PAAD",
+  "Pleural mesothelioma" = "MESO",
+  "Prostate adenocarcinoma" = "PRAD",
+  "Renal cell carcinoma" = "RCC",
+  "Rhabdoid cancer" = "RHAB",
+  "Rhabdomyosarcoma" = "RMS",
+  "Synovial sarcoma" = "SS",
+  "T-lymphoblastic leukemia/lymphoma" = "T-LBL",
+  "Undifferentiated pleomorphic sarcoma" = "UPS",
+  # Extra spelling variants seen in other scripts (kept as synonyms only;
+  # complex_dependency_analysis.Rmd's own spelling remains authoritative)
+  "Undifferentiated pleomorphic sarcoma/malignant fibrous histiocytoma" = "UPS",
+  "Undifferentiated pleomorphic sarcoma/malignant fibrous histiocytoma/high-grade spindle cell sarcoma" = "UPS"
+)
+
+abbrev_map_lower <- abbrev_map
+names(abbrev_map_lower) <- tolower(names(abbrev_map))
+
+abbreviate_lineage <- function(x) {
+  out <- abbrev_map_lower[tolower(x)]
+  unmapped <- x[is.na(out)]
+  if (length(unmapped)) {
+    message("  [abbrev] No abbreviation found for: ", paste(unique(unmapped), collapse = "; "))
+  }
+  out[is.na(out)] <- x[is.na(out)]
+  unname(out)
+}
+
+norm_sym <- function(x) {
+  x <- toupper(as.character(x))
+  x <- gsub("\\(.*?\\)", "", x, perl = TRUE)
+  x <- gsub("[^A-Z0-9-]", "-", x, perl = TRUE)
+  x <- gsub("-+", "-", x, perl = TRUE)
+  x <- gsub("^-|-$", "", x, perl = TRUE)
+  trimws(x)
+}
+
+# Pull Hallmark gene sets (human) -- Entrez-based (GSEA needs Entrez)
+msigdb_h <- msigdbr(species = "Homo sapiens", category = "H")
+
+hallmark_gene_sets_entrez <- lapply(hallmark_names, function(nm) {
+  unique(as.character(msigdb_h$entrez_gene[msigdb_h$gs_name == nm]))
+})
+names(hallmark_gene_sets_entrez) <- hallmark_names
+```
+
+```{r load_fig1A_and_lineage_table}
+## ------------------------------------------------------------
+## Import Figure 1A's limma output and its exact CellLine->Lineage
+## assignment directly -- no re-fitting, so results are guaranteed
+## identical to the heatmap, not just similarly coded.
+## ------------------------------------------------------------
+
+fig1A_raw <- read_csv(FIG1A_FILE, show_col_types = FALSE)
+lineage_tbl <- read_csv(LINEAGE_FILE, show_col_types = FALSE) %>%
+  mutate(CellLine = as.character(CellLine))
+
+cat(sprintf("Figure 1A import: %d complexes x %d lineages\n",
+            n_distinct(fig1A_raw$Complex), n_distinct(fig1A_raw$Lineage)))
+cat(sprintf("Cell-line/lineage table import: %d cell lines across %d lineages\n",
+            n_distinct(lineage_tbl$CellLine), n_distinct(lineage_tbl$Lineage)))
+
+# Guard: fail loudly here if the expected complex label is missing from
+# fig1A_raw, rather than propagating a silent 0-row table three chunks
+# downstream (this is exactly the class of bug that just happened).
+if (!(SET1C_COMPLEX_NAME_FIG1A %in% unique(fig1A_raw$Complex))) {
+  stop("SET1C_COMPLEX_NAME_FIG1A ('", SET1C_COMPLEX_NAME_FIG1A, "') not found in fig1A_raw$Complex. ",
+       "Available complex labels: ", paste(unique(fig1A_raw$Complex), collapse = ", "))
+}
+```
+
+```{r derive_set1compass_genes}
+## ------------------------------------------------------------
+## Derive the Set1C/COMPASS gene list from the SAME gene->complex
+## mapping (epi_map, from EpiGenes_main.xlsx) that the heatmap's
+## "Set1C/COMPASS" column is built from -- rather than a separately
+## hardcoded gene list that could silently drift out of sync.
+##
+## NOTE: epi_map uses the RAW EpiGenes_main.xlsx label ("COMPASS"),
+## which is NOT the same string as fig1A_raw's display label
+## ("SET1C/COMPASS") used in the next chunk -- see SET1C_COMPLEX_NAME_EPI
+## vs SET1C_COMPLEX_NAME_FIG1A above.
+## ------------------------------------------------------------
+
+epi_raw <- readxl::read_xlsx(FN_EPI)
+nm_lower <- tolower(names(epi_raw))
+hgnc_col <- names(epi_raw)[which(nm_lower %in% c("hgnc_symbol", "hgnc", "symbol", "gene", "gene_symbol"))[1]]
+cx_col   <- names(epi_raw)[which(nm_lower %in% c("complex_name", "complex", "complexes"))[1]]
+
+epi_map <- tibble(
+  SYMBOL  = norm_sym(epi_raw[[hgnc_col]]),
+  Complex = as.character(epi_raw[[cx_col]])
+) %>%
+  filter(!is.na(SYMBOL), SYMBOL != "", !is.na(Complex), Complex != "") %>%
+  separate_rows(Complex, sep = "\\s*[;,]\\s*") %>%
+  mutate(Complex = str_squish(Complex)) %>%
+  filter(Complex != "") %>%
+  distinct(SYMBOL, Complex)
+
+# Sanity check before filtering: confirm the exact label is present, and
+# show what else is there (so a future rename fails loudly here instead of
+# silently downstream).
+compass_family <- grep("SET1|COMPASS", unique(epi_map$Complex), ignore.case = TRUE, value = TRUE)
+message("COMPASS-family labels found in epi_map$Complex: ", paste(compass_family, collapse = ", "))
+if (!(SET1C_COMPLEX_NAME_EPI %in% unique(epi_map$Complex))) {
+  stop("SET1C_COMPLEX_NAME_EPI ('", SET1C_COMPLEX_NAME_EPI, "') not found in epi_map$Complex. ",
+       "COMPASS-family labels available: ", paste(compass_family, collapse = ", "))
+}
+
+set1compass_genes <- epi_map %>%
+  filter(Complex == SET1C_COMPLEX_NAME_EPI) %>%
+  pull(SYMBOL) %>%
+  unique()
+
+if (length(set1compass_genes) == 0) {
+  stop("No genes found for Complex == '", SET1C_COMPLEX_NAME_EPI, "' in EpiGenes_main.xlsx. ",
+       "Check SET1C_COMPLEX_NAME_EPI against the heatmap's exact column label.")
+}
+message("Set1C/COMPASS genes (from epi_map, same source as the heatmap column): ",
+        paste(set1compass_genes, collapse = ", "))
+```
+
+```{r build_fig1A_set1c}
+## ------------------------------------------------------------
+## Extract + Z-score the SET1C/COMPASS row across lineages, exactly
+## as done for the heatmap (same source table, imported above).
+## ------------------------------------------------------------
+
+build_fig1A_set1c <- function(fig1A_raw, complex_name) {
+  fig1A_raw %>%
+    filter(Complex == complex_name) %>%
+    transmute(
+      Lineage_full = Lineage,
+      logFC_dependency = logFC,
+      FDR_dependency    = adj.P.Val
+    ) %>%
+    mutate(
+      Z_dependency = as.numeric(scale(logFC_dependency)),
+      Lineage = abbreviate_lineage(Lineage_full)
+    ) %>%
+    select(Lineage, Z_dependency, FDR_dependency)
+}
+
+fig1A_set1c <- build_fig1A_set1c(fig1A_raw, SET1C_COMPLEX_NAME_FIG1A)
+
+# Guard: fail loudly rather than silently propagate a 0-row table.
+stopifnot(
+  "fig1A_set1c has 0 rows -- check SET1C_COMPLEX_NAME_FIG1A against fig1A_raw$Complex" =
+    nrow(fig1A_set1c) > 0
+)
+
+cat(sprintf("Figure 1A (%s): %d lineages\n", SET1C_COMPLEX_NAME_FIG1A, nrow(fig1A_set1c)))
+```
+
+```{r partB_helpers}
+## ------------------------------------------------------------
+## Helper functions for the per-lineage Hallmark GSEA (dependency
+## only, matching the PI's dependency-only instruction).
+## ------------------------------------------------------------
+
+detect_id_col <- function(df) {
+  if ("DepMap_ID" %in% names(df)) {
+    "DepMap_ID"
+  } else if ("ModelID" %in% names(df)) {
+    "ModelID"
+  } else {
+    names(df)[1]
+  }
+}
+
+extract_genes_wide <- function(df, id_name, genes) {
+  gcols <- base::setdiff(names(df), id_name)
+  syms  <- toupper(trimws(sub("\\s*\\(.*$", "", gcols)))
+  idx   <- match(toupper(genes), syms)
+  found <- genes[!is.na(idx)]
+  miss  <- genes[is.na(idx)]
+  if (length(miss)) message("  [not found] ", paste(miss, collapse = ", "))
+  cols  <- gcols[idx[!is.na(idx)]]
+  out <- df[, c(id_name, cols), drop = FALSE]
+  names(out) <- c("CellLine", found)
+  out %>%
+    mutate(CellLine = as.character(CellLine),
+           across(all_of(found), ~ suppressWarnings(as.numeric(.))))
+}
+
+row_score <- function(wide_df, genes) {
+  g <- base::intersect(genes, names(wide_df))
+  if (length(g) == 0) return(rep(NA_real_, nrow(wide_df)))
+  rowMeans(as.matrix(wide_df[, g, drop = FALSE]), na.rm = TRUE)
+}
+
+load_wide_matrix <- function(file) {
+  raw <- read_csv(file, show_col_types = FALSE)
+  if ("IsDefaultEntryForModel" %in% names(raw)) {
+    raw <- raw %>% filter(IsDefaultEntryForModel %in% c("Yes", TRUE, "TRUE"))
+  }
+  id_col <- detect_id_col(raw)
+  meta_cols <- base::intersect(
+    c("...1", "SequencingID", "ModelConditionID", "IsDefaultEntryForMC",
+      "IsDefaultEntryForModel", "DepMap_ID", "ModelID"),
+    names(raw)
+  )
+  meta_cols <- base::setdiff(meta_cols, id_col)
+  raw <- raw %>% select(-all_of(meta_cols))
+  list(raw = raw, id_col = id_col)
+}
+
+# ---- Load the genome-wide dependency matrix used for GSEA ranking ----
+# NOTE: this is a DIFFERENT CRISPR export than the complex-level heatmap
+# input (CRISPRGeneDependency_nonEpiGenes.csv vs CRISPRGeneDependency.csv),
+# kept as-is per the original script design -- confirm with whoever produced
+# these exports whether they're meant to be the same underlying data.
+DEP_FILE <- file.path(IN_DIR, "CRISPRGeneDependency_nonEpiGenes.csv")
+
+message("Loading CRISPR dependency matrix (Set1C/COMPASS phenotype source for GSEA)...")
+dep_loaded <- load_wide_matrix(DEP_FILE)
+dep_raw    <- dep_loaded$raw
+dep_id     <- dep_loaded$id_col
+
+dep_w <- extract_genes_wide(dep_raw, dep_id, set1compass_genes)
+set1c_genes_present <- base::intersect(set1compass_genes, names(dep_w))
+message("Set1C/COMPASS genes used (present in GSEA dependency data): ",
+        paste(set1c_genes_present, collapse = ", "))
+
+dep_w <- dep_w %>%
+  mutate(Set1C_score = row_score(., set1c_genes_present)) %>%
+  select(CellLine, Set1C_score)
+
+# Full gene-by-cell-line matrix for genome-wide ranking
+full_mat <- dep_raw %>%
+  mutate(.cell = as.character(.data[[dep_id]])) %>%
+  select(-all_of(base::intersect(c(dep_id, "DepMap_ID", "ModelID"), names(dep_raw)))) %>%
+  column_to_rownames(".cell") %>%
+  select(where(is.numeric)) %>%
+  as.data.frame()
+
+colnames(full_mat) <- toupper(trimws(sub("\\s*\\(.*$", "", colnames(full_mat))))
+full_mat <- full_mat[, !duplicated(colnames(full_mat)), drop = FALSE]
+
+# Drop Set1C/COMPASS genes from GSEA features to avoid trivial self-correlation
+gsea_features <- base::setdiff(colnames(full_mat), set1compass_genes)
+
+message("Building SYMBOL -> ENTREZ map...")
+symbol2entrez <- suppressMessages(
+  bitr(colnames(full_mat), fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+) %>%
+  distinct(SYMBOL, ENTREZID) %>%
+  group_by(SYMBOL) %>%
+  dplyr::slice(1) %>%
+  ungroup()
+```
+
+```{r run_partB_gsea}
+## ------------------------------------------------------------
+## Per-lineage Hallmark GSEA, run over the EXACT SAME lineage_tbl
+## (cell lines + lineages) imported from complex_dependency_
+## analysis.Rmd's own output -- so this is the same cohort as the
+## Figure 1A heatmap, not a re-derived approximation of it.
+## ------------------------------------------------------------
+
+lineage_lookup <- lineage_tbl %>%
+  inner_join(dep_w, by = "CellLine")
+
+cat(sprintf("Cell lines with both lineage assignment and dependency data: %d\n",
+            nrow(lineage_lookup)))
+
+lineages_ok <- lineage_lookup %>%
+  count(Lineage, name = "n") %>%
+  filter(n >= MIN_PER_LINEAGE) %>%
+  pull(Lineage)
+
+cat(sprintf("Lineages with >= %d cell lines: %d\n", MIN_PER_LINEAGE, length(lineages_ok)))
+
+run_lineage_gsea <- function(lin) {
+  cells_lin <- lineage_lookup %>% filter(Lineage == lin) %>% pull(CellLine)
+  cells_lin <- base::intersect(cells_lin, rownames(full_mat))
+  if (length(cells_lin) < MIN_PER_LINEAGE) return(NULL)
+
+  mat_lin <- full_mat[cells_lin, gsea_features, drop = FALSE]
+  pheno   <- lineage_lookup %>%
+    filter(CellLine %in% cells_lin) %>%
+    arrange(match(CellLine, cells_lin)) %>%
+    pull(Set1C_score)
+
+  if (length(pheno) != nrow(mat_lin) || all(is.na(pheno))) return(NULL)
+
+  X <- as.matrix(mat_lin)
+  stats_sym <- apply(X, 2, function(x) suppressWarnings(
+    cor(x, pheno, method = method_cor, use = "pairwise.complete.obs")
+  ))
+  stats_sym <- stats_sym[is.finite(stats_sym)]
+  if (length(stats_sym) < 50) return(NULL)
+
+  df <- tibble(SYMBOL = names(stats_sym), stat = as.numeric(stats_sym)) %>%
+    inner_join(symbol2entrez, by = "SYMBOL") %>%
+    group_by(ENTREZID) %>%
+    dplyr::slice_max(order_by = abs(stat), n = 1, with_ties = FALSE) %>%
+    ungroup()
+
+  stats_ent <- df$stat
+  names(stats_ent) <- df$ENTREZID
+  set.seed(1)
+  stats_ent <- stats_ent + rnorm(length(stats_ent), mean = 0, sd = 1e-8)
+  stats_ent <- sort(stats_ent, decreasing = TRUE)
+
+  res <- suppressWarnings(
+    fgseaMultilevel(
+      pathways = hallmark_gene_sets_entrez,
+      stats    = stats_ent,
+      minSize  = minSize,
+      maxSize  = maxSize,
+      eps      = 1e-50
+    )
+  ) %>% as.data.frame()
+
+  res$Lineage <- lin
+  res$n_cells <- nrow(mat_lin)
+  res
+}
+
+message("Running per-lineage Hallmark GSEA (this may take a while)...")
+partB_results <- lapply(lineages_ok, run_lineage_gsea) %>% bind_rows()
+
+partB_dependency <- lapply(hallmark_names, function(nm) {
+  partB_results %>%
+    filter(pathway == nm) %>%
+    transmute(Lineage, NES, padj, pval, size, n_cells) %>%
+    mutate(Pathway = nm)
+}) %>% bind_rows() %>%
+  mutate(Lineage = abbreviate_lineage(Lineage))
+
+for (nm in hallmark_names) {
+  write_csv(partB_dependency %>% filter(Pathway == nm),
+            file.path(OUT_DIR, sprintf("PartB_Set1C_dependency_vs_%s_perLineage_GSEA.csv", nm)))
+}
+```
+
+```{r plot_function}
+## ------------------------------------------------------------
+## x = NES (GSEA), y = -log10(GSEA FDR)
+## color = Z-scored mean dependency, Fig 1A (heatmap's own variable
+##         + white/white/turquoise palette -- directly comparable to
+##         the heatmap cell color for this lineage)
+## size  = -log10(Fig 1A FDR)
+## ------------------------------------------------------------
+
+plot_dependency_gsea <- function(dat, pathway_label) {
+  dat <- dat %>% arrange(is_melanoma)  # draw melanoma last (on top)
+
+  ggplot(dat, aes(x = NES, y = neglog10_FDR_gsea)) +
+    geom_point(
+      aes(size = neglog10_FDR_fig1A, fill = Z_dependency,
+          color = is_melanoma, stroke = ifelse(is_melanoma, 1.1, 0.3)),
+      shape = 21
+    ) +
+    geom_text_repel(aes(label = Lineage), size = 3, max.overlaps = Inf,
+                     fontface = ifelse(dat$is_melanoma, "bold", "plain")) +
+    scale_fill_gradientn(
+      colors = HEATMAP_PAL_FULL,
+      limits = c(-HEATMAP_ZLIM, HEATMAP_ZLIM),
+      oob    = scales::squish,
+      # Explicit breaks matching pheatmap's own legend tick labels for
+      # complex_limma_heatmap.pdf ({-4,-2,0,2,4}), so the two legends
+      # display identical tick values.
+      breaks = seq(-4, 4, by = 2),
+      labels = seq(-4, 4, by = 2),
+      name   = "Z-scored\nmean dependency\n(Fig 1A)"
+    ) +
+    scale_color_manual(values = c(`TRUE` = "black", `FALSE` = "grey40"),
+                        guide = "none") +
+    scale_size_continuous(name = "-log10(FDR)\nFig 1A dependency\nenrichment", range = c(1.5, 7)) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey60") +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey60") +
+    theme_classic(base_size = 12) +
+    labs(
+      x = "NES (Set1C/COMPASS dependency correlation)",
+      y = expression(-log[10](FDR)~"(GSEA, per lineage)"),
+      title = pathway_label,
+      subtitle = "Black outline = melanoma (MEL)"
+    )
+}
+```
+
+```{r merge_and_plot}
+## ------------------------------------------------------------
+## Merge Fig 1A's Set1C/COMPASS row with the per-lineage GSEA
+## results (same lineage set, same cohort) and produce one plot
+## per Hallmark pathway.
+## ------------------------------------------------------------
+
+merged_all <- partB_dependency %>%
+  inner_join(fig1A_set1c, by = "Lineage") %>%
+  mutate(
+    neglog10_FDR_gsea  = -log10(pmax(padj, 1e-300)),
+    neglog10_FDR_fig1A = -log10(pmax(FDR_dependency, 1e-300)),
+    is_melanoma        = Lineage == MELANOMA_ABBREV
+  )
+
+# Guard: fail loudly if the merge produced nothing, rather than silently
+# generating an empty plot (this is what the OXPHOS blank plot actually was).
+stopifnot(
+  "merged_all has 0 rows -- Fig 1A and GSEA tables did not merge on Lineage" =
+    nrow(merged_all) > 0
+)
+
+n_dropped <- n_distinct(partB_dependency$Lineage) - n_distinct(merged_all$Lineage)
+if (n_dropped > 0) {
+  dropped_lin <- setdiff(unique(partB_dependency$Lineage), unique(merged_all$Lineage))
+  message("[note] ", n_dropped,
+          " lineage(s) present in the GSEA output but absent from Figure 1A ",
+          "(not merged): ", paste(dropped_lin, collapse = ", "))
+}
+n_dropped_rev <- n_distinct(fig1A_set1c$Lineage) - n_distinct(merged_all$Lineage)
+if (n_dropped_rev > 0) {
+  dropped_lin_rev <- setdiff(unique(fig1A_set1c$Lineage), unique(merged_all$Lineage))
+  message("[note] ", n_dropped_rev,
+          " lineage(s) present in Figure 1A but absent from the GSEA output ",
+          "(not merged): ", paste(dropped_lin_rev, collapse = ", "))
+}
+
+for (nm in hallmark_names) {
+  write_csv(
+    merged_all %>% filter(Pathway == nm),
+    file.path(OUT_DIR, sprintf("merged_dependency_fig1A_%s.csv", nm))
+  )
+}
+
+for (nm in hallmark_names) {
+  dat <- merged_all %>% filter(Pathway == nm)
+
+  # Per-pathway guard: catches a repeat of the exact bug you just hit
+  # (e.g. a pathway-specific GSEA failure) with a clear message naming
+  # the pathway, instead of a blank/empty ggplot panel.
+  if (nrow(dat) == 0) {
+    warning("Skipping ", nm, ": 0 rows after filtering merged_all -- check ",
+            "PartB_Set1C_dependency_vs_", nm, "_perLineage_GSEA.csv")
+    next
+  }
+
+  label <- hallmark_labels[[nm]]
+  p <- plot_dependency_gsea(dat, label)
+  ggsave(file.path(OUT_DIR, sprintf("dependency_gsea_fig1A_%s.pdf", nm)), p, width = 6, height = 5)
+  print(p)
+}
+
+cat(sprintf("Done. Outputs written to: %s\n", normalizePath(OUT_DIR)))
+```
