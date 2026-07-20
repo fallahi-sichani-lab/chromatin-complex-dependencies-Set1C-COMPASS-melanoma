@@ -1,0 +1,361 @@
+```{r}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(readxl)
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(stringr)
+  library(tibble)
+  library(limma)
+  library(ggplot2)
+  library(ggrepel)
+  
+  library(dplyr)
+library(conflicted)
+
+conflict_prefer("count", "dplyr")
+conflict_prefer("filter", "dplyr")
+conflict_prefer("select", "dplyr")
+conflict_prefer("arrange", "dplyr")
+conflict_prefer("mutate", "dplyr")
+
+  library(dendextend)
+})
+
+set.seed(42)
+
+# =========================
+# Paths
+# =========================
+IN_DIR <- "."
+FN_CR  <- file.path(IN_DIR, "CRISPRGeneDependency.csv")
+FN_MD  <- file.path(IN_DIR, "Model.csv")
+FN_EPI <- file.path(IN_DIR, "EpiGenes_main.xlsx")
+
+OUT_DIR <- "manuscript_out"
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# =========================
+# Parameters
+# =========================
+MIN_PER_LINEAGE   <- 5
+EXCLUDE_LINEAGES  <- c("NON-CANCEROUS")
+USE_ONLY_EPIGENES <- TRUE
+
+FDR_SIG    <- 0.10
+LOGFC_SIG  <- 0.10
+N_CLUSTERS <- 3
+
+# =========================
+# Helpers
+# =========================
+norm_sym <- function(x) {
+  x <- toupper(as.character(x))
+  x <- gsub("\\(.*?\\)", "", x, perl = TRUE)
+  x <- gsub("[^A-Z0-9-]", "-", x, perl = TRUE)
+  x <- gsub("-+", "-", x, perl = TRUE)
+  x <- gsub("^-|-$", "", x, perl = TRUE)
+  trimws(x)
+}
+
+process_string <- function(s) {
+  s <- tolower(s)
+  gsub("^(\\w)", "\\U\\1", s, perl = TRUE)
+}
+
+# Lineage abbreviations used only for plotting labels
+# (Optional improvement: move this to a CSV and read it in)
+abbrev_map <- c(
+  "Acute myeloid leukemia" = "AML",
+  "Ampullary carcinoma" = "AMPCA",
+  "Anaplastic thyroid cancer" = "ATC",
+  "B-cell acute lymphoblastic leukemia" = "ALLB",
+  "Bladder urothelial carcinoma" = "BLCA",
+  "Cervical squamous cell carcinoma" = "CESC",
+  "Colorectal adenocarcinoma" = "COAD",
+  "Cutaneous squamous cell carcinoma" = "CSCC",
+  "Diffuse glioma" = "GLIOMA",
+  "Embryonal tumor" = "EMBT",
+  "Endometrial carcinoma" = "UCEC",
+  "Esophageal squamous cell carcinoma" = "ESCC",
+  "Esophagogastric adenocarcinoma" = "EGA",
+  "Ewing sarcoma" = "EWS",
+  "Head and neck squamous cell carcinoma" = "HNSC",
+  "Hepatocellular carcinoma" = "HCC",
+  "Intracholecystic papillary neoplasm" = "ICPN",
+  "Intraductal papillary neoplasm of the bile duct" = "IPNB",
+  "Invasive breast carcinoma" = "BRCA",
+  "Liposarcoma" = "LPS",
+  "Lung neuroendocrine tumor" = "LNET",
+  "Mature b-cell neoplasms" = "MBN",
+  "Mature t and nk neoplasms" = "MTNN",
+  "Melanoma" = "MEL",
+  "Myeloproliferative neoplasms" = "MPN",
+  "Nerve sheath tumor" = "NST",
+  "Neuroblastoma" = "NBL",
+  "Non-hodgkin lymphoma" = "NHL",
+  "Non-seminomatous germ cell tumor" = "NSGCT",
+  "Non-small cell lung cancer" = "NSCLC",
+  "Ocular melanoma" = "OM",
+  "Osteosarcoma" = "OS",
+  "Ovarian epithelial tumor" = "OV",
+  "Pancreatic adenocarcinoma" = "PAAD",
+  "Pleural mesothelioma" = "MESO",
+  "Prostate adenocarcinoma" = "PRAD",
+  "Renal cell carcinoma" = "RCC",
+  "Rhabdoid cancer" = "RHAB",
+  "Rhabdomyosarcoma" = "RMS",
+  "Synovial sarcoma" = "SS",
+  "T-lymphoblastic leukemia/lymphoma" = "TALL",
+  "Undifferentiated pleomorphic sarcoma/malignant fibrous histiocytoma/high-grade spindle cell sarcoma" = "UPS"
+)
+
+# =========================
+# Load CRISPR dependency matrix
+# =========================
+# Reads a wide matrix: one row per cell line, gene columns may include duplicate headers after cleaning
+crispr_raw <- data.table::fread(FN_CR, check.names = TRUE)
+
+id_col <- intersect(
+  c("DepMap_ID", "depmap_id", "ModelID", "model_id", "ACH_ID", "ACH", "V1"),
+  names(crispr_raw)
+)[1]
+
+gene_cols_raw <- setdiff(names(crispr_raw), id_col)
+gene_clean <- gsub("\\.\\.[0-9]+\\.$", "", gene_cols_raw)
+gene_clean <- gsub("\\.+", "-", gene_clean)
+gene_clean <- norm_sym(gene_clean)
+names(crispr_raw)[match(gene_cols_raw, names(crispr_raw))] <- gene_clean
+
+# Merge duplicated gene names created by header normalization (row-wise mean across duplicate columns)
+dup_names <- unique(gene_clean[duplicated(gene_clean)])
+if (length(dup_names)) {
+  for (gn in dup_names) {
+    cols <- which(names(crispr_raw) == gn)
+    crispr_raw[[gn]] <- rowMeans(crispr_raw[, ..cols], na.rm = TRUE)
+    if (length(cols) > 1) crispr_raw <- crispr_raw[, -cols[-1], with = FALSE]
+  }
+}
+
+gene_cols <- setdiff(names(crispr_raw), id_col)
+for (g in gene_cols) crispr_raw[[g]] <- suppressWarnings(as.numeric(crispr_raw[[g]]))
+for (g in gene_cols) crispr_raw[[g]][is.nan(crispr_raw[[g]])] <- NA_real_
+
+dep_df <- as_tibble(crispr_raw) %>%
+  rename(DepMap_ID = !!id_col) %>%
+  mutate(CellLine = as.character(DepMap_ID))
+
+# =========================
+# Load metadata and attach lineage
+# =========================
+# Adds an Oncotree lineage per cell line and filters to lineages with sufficient sample sizes
+model <- data.table::fread(FN_MD, check.names = FALSE)
+
+model_keys <- model %>%
+  transmute(
+    DepMap_ID = as.character(ModelID),
+    Lineage   = coalesce(OncotreePrimaryDisease, OncotreeLineage)
+  ) %>%
+  distinct()
+
+dat0 <- dep_df %>%
+  left_join(model_keys, by = c("CellLine" = "DepMap_ID"))
+
+dat0 <- dat0 %>%
+  mutate(Lineage_norm = norm_sym(Lineage)) %>%
+  filter(!(Lineage_norm %in% norm_sym(EXCLUDE_LINEAGES))) %>%
+  select(-Lineage_norm)
+
+keep_lin <- dat0 %>%
+  distinct(CellLine, Lineage) %>%
+  count(Lineage, name = "n") %>%
+  filter(n >= MIN_PER_LINEAGE) %>%
+  pull(Lineage)
+
+dat0 <- dat0 %>%
+  filter(Lineage %in% keep_lin)
+
+# =========================
+# Load epigenetic gene list and subset genes
+# =========================
+# Restricts gene-level analysis to the curated epigenetic gene set (optional)
+if (USE_ONLY_EPIGENES) {
+  epi_raw <- readxl::read_xlsx(FN_EPI)
+  nm_lower <- tolower(names(epi_raw))
+
+  hgnc_col <- names(epi_raw)[which(nm_lower %in% c("hgnc_symbol", "hgnc", "symbol", "gene", "gene_symbol"))[1]]
+  epi_genes <- norm_sym(epi_raw[[hgnc_col]])
+
+  keep_genes <- intersect(epi_genes, setdiff(names(dat0), c("CellLine", "DepMap_ID", "Lineage")))
+} else {
+  keep_genes <- setdiff(names(dat0), c("CellLine", "DepMap_ID", "Lineage"))
+}
+
+# =========================
+# Dependency long table: CellLine × Gene
+# =========================
+# Converts the wide dependency matrix to tidy format for modeling
+dep_long <- dat0 %>%
+  select(CellLine, Lineage, all_of(keep_genes)) %>%
+  pivot_longer(cols = all_of(keep_genes), names_to = "Gene", values_to = "Score") %>%
+  mutate(Gene = norm_sym(Gene)) %>%
+  filter(is.finite(Score))
+
+# =========================
+# Gene-level limma (one-vs-rest)
+# =========================
+# Builds a Gene × CellLine matrix and runs limma with one-vs-rest contrasts for each lineage
+dep_wide <- dep_long %>%
+  select(CellLine, Gene, Score) %>%
+  pivot_wider(names_from = CellLine, values_from = Score)
+
+mat <- as.matrix(dep_wide[, -1, drop = FALSE])
+rownames(mat) <- dep_wide$Gene
+
+sample_ann <- dep_long %>%
+  distinct(CellLine, Lineage) %>%
+  mutate(Lineage = process_string(Lineage)) %>%
+  add_count(Lineage, name = "n_lineage") %>%
+  filter(n_lineage >= MIN_PER_LINEAGE) %>%
+  select(CellLine, Lineage)
+
+mat <- mat[, sample_ann$CellLine, drop = FALSE]
+
+# Remove genes with missing values or zero variance across cell lines
+mat <- mat[complete.cases(mat), , drop = FALSE]
+mat <- mat[apply(mat, 1, function(x) sd(x, na.rm = TRUE) > 0), , drop = FALSE]
+
+design <- model.matrix(~ 0 + Lineage, data = sample_ann)
+colnames(design) <- sub("^Lineage", "", colnames(design))
+
+lineages <- colnames(design)
+K <- length(lineages)
+
+Cmat <- sapply(lineages, function(li) {
+  v <- rep(-1 / (K - 1), K)
+  names(v) <- lineages
+  v[li] <- 1
+  v
+})
+colnames(Cmat) <- lineages
+rownames(Cmat) <- lineages
+
+fit   <- lmFit(mat, design)
+fit.c <- contrasts.fit(fit, Cmat)
+fit.c <- eBayes(fit.c, robust = TRUE)
+
+de_tbl <- lapply(seq_along(lineages), function(i) {
+  lin <- lineages[i]
+  topTable(fit.c, coef = i, number = Inf, sort.by = "none") %>%
+    rownames_to_column("Gene") %>%
+    transmute(
+      Lineage    = lin,
+      Gene,
+      logFC      = logFC,
+      adj.P.Val  = adj.P.Val
+    )
+}) %>%
+  bind_rows()
+
+write_csv(de_tbl, file.path(OUT_DIR, "limma_gene_one_vs_rest_all_lineages.csv"))
+
+# =========================
+# Build significant-gene matrix (Lineage × Gene)
+# =========================
+# Summarizes (Lineage, Gene) results and selects genes significant in any lineage
+gene_summary <- de_tbl %>%
+  group_by(Lineage, Gene) %>%
+  summarise(
+    logFC     = mean(logFC, na.rm = TRUE),
+    adj.P.Val = min(adj.P.Val, na.rm = TRUE),
+    .groups   = "drop"
+  )
+
+sig_genes <- gene_summary %>%
+  group_by(Gene) %>%
+  summarise(any_sig = any(adj.P.Val <= FDR_SIG & logFC > LOGFC_SIG, na.rm = TRUE), .groups = "drop") %>%
+  filter(any_sig) %>%
+  pull(Gene)
+
+mat_fc <- gene_summary %>%
+  select(Lineage, Gene, logFC) %>%
+  pivot_wider(names_from = Gene, values_from = logFC) %>%
+  as.data.frame()
+
+rownames(mat_fc) <- mat_fc$Lineage
+mat_fc$Lineage <- NULL
+mat_fc <- as.matrix(mat_fc)
+
+# Row-wise z-scoring: each lineage is scaled across genes for comparable clustering/PCA
+mat_fc_z <- t(scale(t(mat_fc)))
+mat_fc_z[is.na(mat_fc_z)] <- 0
+
+mat_fc_sig <- mat_fc_z[, sig_genes, drop = FALSE]
+
+# =========================
+# Dendrogram (lineage clustering)
+# =========================
+# Clusters lineages using Ward linkage on the significant-gene matrix
+hc <- hclust(dist(mat_fc_sig), method = "ward.D2")
+dend <- as.dendrogram(hc)
+
+lineage_names <- rownames(mat_fc_sig)
+display_labels <- ifelse(
+  is.na(abbrev_map[lineage_names]),
+  lineage_names,
+  paste0(lineage_names, " (", abbrev_map[lineage_names], ")")
+)
+
+# Ensure dendrogram labels match the matrix order
+dend <- dend %>%
+  dendextend::set("labels", display_labels[order.dendrogram(dend)])
+
+pdf(file.path(OUT_DIR, "lineage_tree_k3.pdf"), width = 7, height = 7)
+par(mar = c(5, 2, 2, 22))
+plot(dend, horiz = TRUE, hang = -1, main = "")
+dev.off()
+
+# =========================
+# PCA (colored by dendrogram clusters)
+# =========================
+# Assign 3 clusters from the dendrogram and plot lineages in PC space
+clusters <- cutree(hc, k = N_CLUSTERS)
+
+pca_res <- prcomp(mat_fc_sig, scale. = TRUE)
+
+pvar <- (pca_res$sdev^2 / sum(pca_res$sdev^2)) * 100
+pc1_var <- round(pvar[1], 1)
+pc2_var <- round(pvar[2], 1)
+
+pca_scores <- as.data.frame(pca_res$x) %>%
+  rownames_to_column("Lineage") %>%
+  mutate(
+    Cluster = factor(clusters[Lineage]),
+    Abbrev  = abbrev_map[Lineage],
+    Label   = ifelse(is.na(Abbrev), Lineage, Abbrev)
+  )
+
+cluster_colors <- c(
+  "1" = "#8770E0",
+  "2" = "#26C6DA",
+  "3" = "#85D484"
+)
+
+pdf(file.path(OUT_DIR, "single_gene_pca_clustered.pdf"), width = 4, height = 4)
+
+p_pca <- ggplot(pca_scores, aes(x = PC1, y = PC2, fill = Cluster, label = Label)) +
+  geom_point(shape = 21, size = 3, color = "black", stroke = 0.4) +
+  geom_text_repel(color = "black", size = 4, max.overlaps = Inf) +
+  scale_fill_manual(values = cluster_colors) +
+  theme_classic(base_size = 12) +
+  labs(
+    title = "",
+    x = sprintf("PC1 (%.1f%%)", pc1_var),
+    y = sprintf("PC2 (%.1f%%)", pc2_var)
+  ) +
+  theme(legend.position = "none")
+
+print(p_pca)
+dev.off()
+```
