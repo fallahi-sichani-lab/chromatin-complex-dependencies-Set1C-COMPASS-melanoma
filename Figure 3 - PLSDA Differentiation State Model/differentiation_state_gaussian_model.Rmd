@@ -1,0 +1,294 @@
+```{r}
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+  library(tidyr)
+  library(pheatmap)
+  library(RColorBrewer)
+  library(mclust)
+  library(stringr)
+})
+
+set.seed(42)
+
+# =========================
+# Paths + output folder
+# =========================
+FILE_SIG  <- "Tsoi_differentiation_state_signatures.csv"
+FILE_EXPR <- "Melanoma_OmicsExpressionProteinCodingGenesTPMLog1.csv"
+FILE_DEP  <- "Melanoma_Dependency_Matrix_CellLinexGene.csv"
+
+OUT_DIR <- "manuscript_out"
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# =========================
+# Parameters / constants
+# =========================
+# Differentiation trajectory order used to:
+#  - order genes in the heatmap
+#  - compute per-state scores and the 1D differentiation axis
+state_order <- c(
+  "Melanocytic",
+  "Transitory-Melanocytic",
+  "Transitory",
+  "Neural crest-like-Transitory",
+  "Neural crest-like",
+  "Undifferentiated-Neural crest-like",
+  "Undifferentiated"
+)
+
+# Cell lines to keep in the expression heatmap (verified melanoma panel)
+melanoma_lines <- c(
+  "COLO794","WM983B","A101D","SKMEL1","IGR39","HT144","WM3211",
+  "HS944T","SH4","COLO679","C32","MM386","YUHOIN0650","MM415",
+  "HS939T","MM485","SKMEL19","CHL1DM","HS695T","M140325","RVH421",
+  "HS294T","RPMI7951","MM370","G361","WM2664","MM253","UACC62",
+  "K029AX","IGR1","CJM","MMAC","HMY1","IGR37","MM127","M040416",
+  "SKMEL24","COLO783","WM4235","NZM3","SKMEL5","MM383","WM1799",
+  "SKMEL2","SEKI","WM115","HMCB","SKMEL30","MELHO","SKMEL3",
+  "IPC298","MELJUSO","WM88","MDAMB435S","MALME3M","COLO800",
+  "SKMEL28","HS936T","MM160113","WM793","MEWO","HS852T","COLO829",
+  "A375","COLO741","MM426","SKMEL31","UACC257","A2058","COLO792",
+  "LOXIMVI"
+)
+
+# =========================
+# Import inputs
+# =========================
+# Signature file is expected to have:
+#   - Gene
+#   - DifferentiationState   (exact column name)
+sig_df <- read_csv(FILE_SIG, show_col_types = FALSE) %>%
+  transmute(
+    Gene = str_trim(as.character(Gene)),
+    DifferentiationState = str_trim(as.character(DifferentiationState))
+  ) %>%
+  filter(
+    !is.na(Gene), Gene != "",
+    !is.na(DifferentiationState), DifferentiationState != ""
+  ) %>%
+  distinct(Gene, DifferentiationState)
+
+# Expression file is expected to have:
+#   - "Cell Line" column
+#   - one column per gene (TPM log1 values)
+expr_tpm_log1 <- read_csv(FILE_EXPR, show_col_types = FALSE)
+
+# Remove common index column if present (e.g., "...1")
+if ("...1" %in% names(expr_tpm_log1)) {
+  expr_tpm_log1 <- expr_tpm_log1 %>% select(-`...1`)
+}
+
+# =========================
+# Subset expression to melanoma panel + signature genes
+# =========================
+# Keep only the melanoma cell lines of interest
+expr_tpm_log1 <- expr_tpm_log1 %>%
+  filter(`Cell Line` %in% melanoma_lines)
+
+# Intersect signature gene list with expression columns
+genes_sig    <- unique(sig_df$Gene)
+genes_common <- intersect(genes_sig, colnames(expr_tpm_log1))
+
+# Build expression matrix restricted to signature genes (and keep the cell line id column)
+expr_sig <- expr_tpm_log1 %>%
+  select(`Cell Line`, all_of(genes_common))
+
+# =========================
+# Z-score normalize expression per gene
+# =========================
+# mat_z: rows = cell lines, cols = genes
+# Each gene column is standardized across cell lines (mean 0, sd 1)
+mat_expr <- expr_sig %>%
+  select(-`Cell Line`) %>%
+  as.matrix()
+
+mat_z <- scale(mat_expr, center = TRUE, scale = TRUE)
+rownames(mat_z) <- expr_sig$`Cell Line`
+
+# =========================
+# Order genes by differentiation state + build column annotation
+# =========================
+# If a gene appears multiple times in the signature file, keep the first entry
+# (stable + deterministic ordering)
+gene_state_df <- sig_df %>%
+  filter(Gene %in% genes_common) %>%
+  distinct(Gene, .keep_all = TRUE) %>%
+  mutate(
+    DifferentiationState = factor(DifferentiationState, levels = state_order)
+  ) %>%
+  arrange(DifferentiationState, Gene)
+
+ordered_genes <- gene_state_df$Gene
+mat_z_ordered <- mat_z[, ordered_genes, drop = FALSE]
+
+# Column annotation: one row per gene (column)
+annotation_col <- data.frame(
+  DifferentiationState = gene_state_df$DifferentiationState
+)
+rownames(annotation_col) <- ordered_genes
+
+# Colors for the 7-state gene annotation
+state_cols <- setNames(
+  RColorBrewer::brewer.pal(7, "Set2"),
+  state_order
+)
+
+# =========================
+# Compute 1D differentiation axis + Gaussian 2-class labels
+# =========================
+# Aggregate expression by state per cell line
+#    (mean z-score of genes belonging to each state)
+state_scores <- sapply(state_order, function(st) {
+  genes_st <- gene_state_df$Gene[gene_state_df$DifferentiationState == st]
+  genes_st <- intersect(genes_st, colnames(mat_z_ordered))
+  if (length(genes_st) == 0) return(rep(NA_real_, nrow(mat_z_ordered)))
+  rowMeans(mat_z_ordered[, genes_st, drop = FALSE], na.rm = TRUE)
+})
+colnames(state_scores) <- state_order
+rownames(state_scores) <- rownames(mat_z_ordered)
+
+# Assign each cell line a dominant 7-class state (highest mean)
+dominant_idx   <- max.col(state_scores, ties.method = "first")
+dominant_state <- factor(state_order[dominant_idx], levels = state_order)
+names(dominant_state) <- rownames(state_scores)
+
+# Build a 1D axis: melanocytic score minus undifferentiated/NC-like score
+# (Neural crest-like-Transitory is intentionally not used as an anchor)
+mel_states <- c("Melanocytic", "Transitory-Melanocytic", "Transitory")
+und_states <- c("Neural crest-like", "Undifferentiated-Neural crest-like", "Undifferentiated")
+
+mel_score <- rowMeans(state_scores[, mel_states, drop = FALSE], na.rm = TRUE)
+und_score <- rowMeans(state_scores[, und_states, drop = FALSE], na.rm = TRUE)
+
+diff_axis <- mel_score - und_score
+names(diff_axis) <- rownames(state_scores)
+
+# Fit 2-component Gaussian mixture on the 1D axis
+#    Label the higher-mean component as "Melanocytic-like"
+mc <- Mclust(diff_axis, G = 2)
+mu <- mc$parameters$mean
+cluster <- mc$classification
+high_k <- which.max(mu)
+
+class2 <- ifelse(cluster == high_k, "Melanocytic-like", "Undifferentiated/NC-like")
+class2 <- factor(class2, levels = c("Melanocytic-like", "Undifferentiated/NC-like"))
+names(class2) <- names(diff_axis)
+
+# Save a per-cell-line classification table (used downstream for joining)
+cell_class_tbl <- tibble(
+  CellLine              = names(diff_axis),
+  DiffAxis              = as.numeric(diff_axis),
+  Dominant_state_7class  = as.character(dominant_state),
+  GaussianClass          = as.character(class2)
+)
+```
+
+```{r}
+# =========================
+# Final heatmap with “fancy” annotations
+# =========================
+# Row order is fixed by diff_axis:
+#   top = most undifferentiated/NC-like  → bottom = most melanocytic-like
+ordered_rows <- names(sort(diff_axis))
+mat_z_axis   <- mat_z_ordered[ordered_rows, , drop = FALSE]
+
+# Row annotation: the 2-class Gaussian label
+annotation_row <- data.frame(
+  GaussianClass = class2[ordered_rows]
+)
+rownames(annotation_row) <- ordered_rows
+
+# Annotation color maps (genes + cell lines)
+two_class_cols <- c(
+  "Melanocytic-like"         = "#8770E0",
+  "Undifferentiated/NC-like" = "#85D484"
+)
+
+annotation_colors <- list(
+  DifferentiationState = state_cols,
+  GaussianClass        = two_class_cols
+)
+
+# Heatmap colors (green → neutral → purple), symmetric clipping
+z_lim  <- 3
+breaks <- seq(-z_lim, z_lim, length.out = 101)
+my_cols <- colorRampPalette(
+  c("#3E8A4E", "#85D484", "#F3F0F6", "#8770E0", "#4A2BBF")
+)(100)
+
+# ---- 1) Heatmap WITH legends ----
+pdf(file.path(OUT_DIR, "Fig_diffSignature_heatmap_fancyAnnotations.pdf"),
+width = 3, height = 7)
+
+pheatmap(
+mat_z_axis,
+color = my_cols,
+breaks = breaks,
+cluster_rows = FALSE,
+cluster_cols = FALSE,
+annotation_col = annotation_col,
+annotation_row = annotation_row,
+annotation_colors = annotation_colors,
+show_rownames = TRUE,
+show_colnames = FALSE,
+scale = "none",
+fontsize_row = 6,
+main = ""
+)
+
+
+dev.off()
+
+
+# ---- 2) Heatmap NO legends (clean figure) ----
+pdf(file.path(OUT_DIR, "Fig_diffSignature_heatmap_fancyAnnotations_noLegend.pdf"),
+width = 3, height = 7)
+
+
+pheatmap(
+mat_z_axis,
+color = my_cols,
+breaks = breaks,
+cluster_rows = FALSE,
+cluster_cols = FALSE,
+annotation_col = annotation_col,
+annotation_row = annotation_row,
+annotation_colors = annotation_colors,
+show_rownames = TRUE,
+show_colnames = FALSE,
+legend = FALSE,
+annotation_legend = FALSE,
+scale = "none",
+fontsize_row = 6,
+main = ""
+)
+
+
+dev.off()
+
+# =========================
+# Save dependency matrix with GaussianClass appended
+# =========================
+# This joins the 2-class label to your dependency matrix, keeping only shared cell lines.
+dep <- read_csv(FILE_DEP, show_col_types = FALSE)
+
+# If your dependency file has an explicit CellLine column, use it.
+# Otherwise treat the first column as the cell-line identifier.
+cell_col <- if ("CellLine" %in% names(dep)) "CellLine" else names(dep)[1]
+
+gauss_df <- cell_class_tbl %>%
+  select(CellLine, GaussianClass)
+
+shared_cell_lines <- intersect(dep[[cell_col]], gauss_df$CellLine)
+
+dep_annot <- dep %>%
+  filter(.data[[cell_col]] %in% shared_cell_lines) %>%
+  left_join(gauss_df, by = setNames("CellLine", cell_col))
+
+write_csv(
+  dep_annot,
+  file.path(OUT_DIR, "2025_Melanoma_EpiGene_Dependency_GaussianClasses.csv")
+)
+
+```
