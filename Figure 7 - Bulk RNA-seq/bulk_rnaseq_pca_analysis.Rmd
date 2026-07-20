@@ -1,0 +1,300 @@
+```{r}
+# ───────────────────────────────────────────────────────────────────────────────
+# PCA on log2 TPM
+# Inputs:  log_TPM.rds (in the same folder as this script)
+# Outputs: manuscript_out/PCA/
+# PCs shown: PC1–PC4 (scatter panels, variance barplots, PC4 loadings)
+# ───────────────────────────────────────────────────────────────────────────────
+
+# Dependencies
+pkgs <- c("matrixStats", "tidyverse", "patchwork", "pheatmap", "cowplot", "grid")
+to_install <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(to_install) > 0) install.packages(to_install)
+
+library(matrixStats)
+library(tidyverse)
+library(patchwork)
+library(pheatmap)
+library(cowplot)
+library(grid)
+
+# Paths + output
+in_rds <- "logTPM.rds"  # file is in the same folder where this script is run
+outdir <- file.path("manuscript_out", "PCA")
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+# Read expression matrix (genes × samples)
+log2_TPM <- readRDS(in_rds)
+log2_TPM <- as.matrix(log2_TPM)
+
+# Row-wise z-score (genes standardized across samples)
+row_means <- rowMeans(log2_TPM, na.rm = TRUE)
+row_sds   <- rowSds(log2_TPM, na.rm = TRUE)
+
+# Avoid division by zero for constant genes
+row_sds[row_sds == 0 | is.na(row_sds)] <- NA_real_
+
+zscores <- sweep(sweep(log2_TPM, 1, row_means, "-"), 1, row_sds, "/")
+
+# Drop genes that are NA for all samples after z-scoring (e.g., constant genes)
+zscores <- zscores[rowSums(is.na(zscores)) < ncol(zscores), , drop = FALSE]
+
+# Transpose for PCA (samples × genes)
+zscores_t <- t(zscores)
+rownames(zscores_t) <- colnames(zscores)
+
+# Heatmap of z-scores (optional; can be slow with many genes)
+min_val <- min(zscores, na.rm = TRUE)
+max_val <- max(zscores, na.rm = TRUE)
+
+n_neg <- 50
+n_pos <- 50
+
+my_colors <- c(
+  colorRampPalette(c("blue", "white"))(n_neg),
+  colorRampPalette(c("white", "red"))(n_pos)[-1]
+)
+
+breaks <- c(
+  seq(min_val, 0, length.out = n_neg),
+  seq(0, max_val, length.out = n_pos)[-1]
+)
+
+pdf(file.path(outdir, "Zscore_heatmap.pdf"), width = 8, height = 10)
+pheatmap(
+  t(zscores),
+  scale = "none",
+  clustering_distance_cols = "euclidean",
+  clustering_method = "ward.D2",
+  show_colnames = FALSE,
+  show_rownames = TRUE,
+  color = my_colors,
+  breaks = breaks
+)
+dev.off()
+
+# Principal component analysis (PCA) on sample-by-gene z-score matrix
+pca_res <- prcomp(zscores_t, center = TRUE, scale. = FALSE)
+
+# Variance explained
+explained     <- 100 * pca_res$sdev^2 / sum(pca_res$sdev^2)
+cum_explained <- cumsum(explained)
+
+# Scores + sample metadata
+scores <- as.data.frame(pca_res$x)
+scores$SampleName <- rownames(scores)
+
+scores <- scores %>%
+  tidyr::separate(
+    SampleName,
+    into = c("CellLine", "Treatment", "Time", "Rep"),
+    sep = "_",
+    remove = FALSE
+  )
+
+# Aesthetics (treatment colors + cell line shapes)
+pal_treat <- c("siNTC" = "#84D484", "siCXXC1" = "#9C7CFC")
+scores$Treatment <- factor(scores$Treatment, levels = names(pal_treat))
+
+shape_vals <- c(
+  "MALME3M" = 16,
+  "UACC62"  = 15,
+  "LOXIMVI" = 17,
+  "SKMEL28" = 9
+)
+scores$CellLine <- factor(scores$CellLine, levels = names(shape_vals))
+
+# Scatter panels: PC1 vs PC2–PC4 (PC1 on x-axis)
+plot_list <- list()
+
+for (j in 2:4) {
+  plot_list[[paste0("PC1_vs_PC", j)]] <- ggplot(
+    scores,
+    aes(
+      x = PC1,
+      y = .data[[paste0("PC", j)]],
+      colour = Treatment,
+      shape = CellLine
+    )
+  ) +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40") +
+    geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+    geom_point(size = 4.0, alpha = 1) +
+    scale_color_manual(values = pal_treat, drop = FALSE) +
+    scale_shape_manual(values = shape_vals, drop = FALSE) +
+    labs(
+      x = sprintf("PC1 (%.1f%%)", explained[1]),
+      y = sprintf("PC%d (%.1f%%)", j, explained[j]),
+      title = paste0("PC1 vs PC", j)
+    ) +
+    theme_minimal(base_size = 20) +
+    theme(
+      plot.title = element_text(size = 25),
+      legend.position = "none"
+    )
+}
+
+scatter_grid_pc1x <- wrap_plots(plot_list, ncol = 3)
+ggsave(
+  file.path(outdir, "PCA_scatter_PC1_vs_PC2toPC4_PC1_on_X.pdf"),
+  scatter_grid_pc1x,
+  width = 15,
+  height = 5
+)
+
+# Scatter panels: PC2–PC4 vs PC1 (PC1 on y-axis)
+plot_list_y <- list()
+
+for (j in 2:4) {
+  plot_list_y[[paste0("PC", j, "_vs_PC1")]] <- ggplot(
+    scores,
+    aes(
+      x = .data[[paste0("PC", j)]],
+      y = PC1,
+      colour = Treatment,
+      shape = CellLine
+    )
+  ) +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40") +
+    geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+    geom_point(size = 5, alpha = 0.8) +
+    scale_color_manual(values = pal_treat, drop = FALSE) +
+    scale_shape_manual(values = shape_vals, drop = FALSE) +
+    labs(
+      x = sprintf("PC%d (%.1f%%)", j, explained[j]),
+      y = sprintf("PC1 (%.1f%%)", explained[1])
+    ) +
+    theme_classic(base_size = 9) +
+    theme(legend.position = "none")
+}
+
+scatter_grid_pc1y <- wrap_plots(plot_list_y, ncol = 3)
+ggsave(
+  file.path(outdir, "PCA_scatter_PC2toPC4_vs_PC1_PC1_on_Y.pdf"),
+  scatter_grid_pc1y,
+  width = 6,
+  height = 2
+)
+
+# Shared legend saved separately
+dummy_plot <- ggplot(
+  scores,
+  aes(x = PC2, y = PC1, colour = Treatment, shape = CellLine)
+) +
+  geom_point(size = 4) +
+  scale_color_manual(values = pal_treat, drop = FALSE) +
+  scale_shape_manual(values = shape_vals, drop = FALSE) +
+  theme_minimal(base_size = 20)
+
+shared_legend <- cowplot::get_legend(
+  dummy_plot + theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text  = element_text(size = 16)
+  )
+)
+
+pdf(file.path(outdir, "PCA_legend.pdf"), width = 8, height = 2)
+grid.newpage()
+grid.draw(shared_legend)
+dev.off()
+
+# Variance explained barplots (all PCs + PC1–PC4 only)
+df_var <- tibble(
+  PC = seq_along(explained),
+  Individual = explained,
+  Cumulative = cum_explained
+) %>%
+  pivot_longer(
+    cols = c("Individual", "Cumulative"),
+    names_to = "Type",
+    values_to = "Variance"
+  ) %>%
+  mutate(Type = factor(Type, levels = c("Individual", "Cumulative")))
+
+col_map <- c(
+  "Individual" = "#00ACC1",
+  "Cumulative" = "black"
+)
+
+p_var_all <- ggplot(df_var, aes(x = factor(PC), y = Variance, fill = Type)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.65) +
+  scale_fill_manual(values = col_map) +
+  labs(
+    x = "Principal component (PC)",
+    y = "% Variance explained",
+    title = "Principal component analysis"
+  ) +
+  theme_classic(base_size = 18) +
+  theme(
+    legend.title = element_blank(),
+    plot.title = element_text(hjust = 0.5, size = 22)
+  )
+
+ggsave(
+  filename = file.path(outdir, "PCA_variance_barplot_allPCs.pdf"),
+  plot = p_var_all,
+  width = 6,
+  height = 6
+)
+
+df_var_4 <- df_var %>% filter(PC <= 4)
+
+p_var_4 <- ggplot(df_var_4, aes(x = factor(PC), y = Variance, fill = Type)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.65) +
+  scale_fill_manual(values = col_map) +
+  labs(
+    x = "Principal component (PC)",
+    y = "% Variance explained",
+    title = "Principal component analysis"
+  ) +
+  theme_classic(base_size = 9) +
+  theme(
+    legend.title = element_blank(),
+    plot.title = element_text(hjust = 0.5, size = 9)
+  )
+
+ggsave(
+  filename = file.path(outdir, "PCA_variance_barplot_PC1toPC4.pdf"),
+  plot = p_var_4,
+  width = 3,
+  height = 2
+)
+
+# PC4 loadings ranked (barplot)
+pc4 <- as.numeric(pca_res$rotation[, "PC4"])
+df_pc4 <- tibble(
+  rank = seq_along(pc4),
+  PC4_loading = sort(pc4, decreasing = TRUE)
+)
+
+p_load_pc4 <- ggplot(df_pc4, aes(x = rank, y = PC4_loading)) +
+  geom_col(fill = "#9C7CFC", width = 1) +
+  labs(x = NULL, y = "PC4 loading", title = "Ranked PC4 Loadings") +
+  theme_minimal(base_size = 30) +
+  theme(
+    axis.text.x  = element_blank(),
+    axis.ticks.x = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank()
+  )
+
+ggsave(
+  filename = file.path(outdir, "PCA_PC4_ranked_loadings.pdf"),
+  plot = p_load_pc4,
+  width = 10,
+  height = 5
+)
+
+# Save PCA objects for reproducibility
+saveRDS(
+  list(
+    pca_res = pca_res,
+    explained = explained,
+    cum_explained = cum_explained,
+    scores = scores
+  ),
+  file.path(outdir, "PCA_objects_PC1toPC4.rds")
+)
+```
+
