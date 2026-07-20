@@ -1,0 +1,230 @@
+```{r}
+## ============================================================
+## run_gmm_and_plots_both_experiments.R
+## Global (pooled) GMM thresholds + plots for two experiments
+## ============================================================
+##
+## Inputs
+## - single_cell_IF_5lines_exp1.rds  (exp1)
+## - single_cell_IF_3lines_exp2.rds  (exp2)
+##
+## Required columns in each RDS
+## - CellLine, Treatment, Well
+## - <marker>_scaled and <marker>_ln for markers of interest
+##
+## Outputs (written under manuscript_out/)
+## - manuscript_out/exp1/*.pdf and global_thresholds_ln_scaled.csv
+## - manuscript_out/exp2/*.pdf and global_thresholds_ln_scaled.csv
+## ============================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(tibble)
+})
+
+source("gmm_utils.R")
+source("signal_utils.R")
+
+set.seed(1)
+
+out_root <- "manuscript_out"
+dir.create(out_root, showWarnings = FALSE, recursive = TRUE)
+
+rds_exp1 <- "single_cell_IF_5lines_exp1.rds"
+rds_exp2 <- "single_cell_IF_3lines_exp2.rds"
+
+pal_treat <- c("NTC" = "#85D484", "si-CXXC1" = "#8770E0")
+
+order_exp1 <- c("MALME3M", "UACC62", "LOXIMVI", "SKMEL28", "WM115")
+order_exp2 <- c("MALME3M", "LOXIMVI", "SKMEL28")
+
+markers_exp1 <- c("CXXC1", "Ki67", "H3K4me3")
+markers_exp2 <- c(
+  "CXXC1",
+  "DNA",
+  "H3K4me3",
+  "Ki67",
+  "pRb_807_811",
+  "pRb_T373",
+  "pSer5"
+)
+
+# ---- helper: infer markers from *_ln and *_scaled columns ----
+infer_markers_from_df <- function(df) {
+  cn <- names(df)
+
+  ln_mk     <- sub("_ln$", "", cn[grepl("_ln$", cn)])
+  scaled_mk <- sub("_scaled$", "", cn[grepl("_scaled$", cn)])
+
+  sort(intersect(ln_mk, scaled_mk))
+}
+
+run_global_gmm_and_plots <- function(df, exp_label, out_dir, cellline_order,
+                                    markers_requested = NULL,
+                                    thr_ln_overrides = list()) {
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+  # standardize + enforce order
+  df <- standardize_single_cell_df(df, cellline_order = cellline_order)
+
+  # choose markers
+  inferred <- infer_markers_from_df(df)
+  if (is.null(markers_requested)) {
+    present_markers <- inferred
+  } else {
+    present_markers <- intersect(markers_requested, inferred)
+  }
+
+  global_thr_list <- vector("list", length(present_markers))
+  names(global_thr_list) <- present_markers
+
+  for (mk in present_markers) {
+
+    mk_ln     <- paste0(mk, "_ln")
+    mk_scaled <- paste0(mk, "_scaled")
+    x_ln      <- df[[mk_ln]]
+
+    # --- either fit GMM or use forced threshold override ---
+    forced_thr_ln <- thr_ln_overrides[[mk]]
+    if (!is.null(forced_thr_ln) && is.finite(forced_thr_ln)) {
+
+      thr_ln     <- as.numeric(forced_thr_ln)
+      thr_scaled <- exp(thr_ln)  # assumes ln() is natural log of scaled intensity
+
+      fit <- list(
+        thr_ln     = thr_ln,
+        thr_scaled = thr_scaled
+      )
+
+      # (optional) mixture plot not meaningful without a fit; skip it
+      # Still produce violin/%high plots using the forced threshold.
+      high_col <- paste0(mk, "_high")
+      df[[high_col]] <- df[[mk_scaled]] > thr_scaled
+
+      pvals_v <- compute_violin_pvals(df, mk_ln)
+      p_v <- plot_violin_signal(
+        df            = df,
+        signal_ln_col = mk_ln,
+        ylab          = paste0(mk, " ln(scaled intensity)"),
+        pvals_df      = pvals_v,
+        pal_treat     = pal_treat,
+        thr_ln        = thr_ln
+      )
+      save_pdf(p_v, out_dir, paste0(mk, "_violin.pdf"), width = 3, height = 2.5)
+
+      st <- summarise_high_replicates(df, high_col)
+      saveRDS(st$means_df, file.path(out_dir, paste0(mk, "_percentHigh_means.rds")), compress = "xz")
+
+      p_b <- plot_bar_pct(
+        means_df  = st$means_df,
+        pvals_df  = st$pvals_df,
+        pal_treat = pal_treat,
+        ylab      = paste0("% ", mk, " high")
+      )
+      save_pdf(p_b, out_dir, paste0(mk, "_percentHigh.pdf"), width = 3, height = 2.5)
+
+      global_thr_list[[mk]] <- tibble(
+        Marker     = mk,
+        thr_scaled = thr_scaled,
+        thr_ln     = thr_ln
+      )
+
+    } else {
+
+      fit <- fit_gmm_threshold(
+        x_ln        = x_ln,
+        marker_name = paste0(exp_label, " ", mk)
+      )
+
+      # mixture plot
+      p_mix <- plot_gmm_mixture_1d(
+        x_ln  = x_ln,
+        fit   = fit,
+        xlab  = paste0(mk, " ln(scaled intensity)"),
+        title = ""
+      )
+      save_pdf(p_mix, out_dir, paste0(mk, "_mixture.pdf"), width = 2, height = 2)
+
+      # high/low calls on scaled
+      high_col <- paste0(mk, "_high")
+      df[[high_col]] <- df[[mk_scaled]] > fit$thr_scaled
+
+      # violin
+      pvals_v <- compute_violin_pvals(df, mk_ln)
+      p_v <- plot_violin_signal(
+        df            = df,
+        signal_ln_col = mk_ln,
+        ylab          = paste0(mk, " ln(scaled intensity)"),
+        pvals_df      = pvals_v,
+        pal_treat     = pal_treat,
+        thr_ln        = fit$thr_ln
+      )
+      save_pdf(p_v, out_dir, paste0(mk, "_violin.pdf"), width = 3, height = 2.5)
+
+      # %high
+      st <- summarise_high_replicates(df, high_col)
+
+      saveRDS(
+        st$means_df,
+        file.path(out_dir, paste0(mk, "_percentHigh_means.rds")),
+        compress = "xz"
+      )
+
+      p_b <- plot_bar_pct(
+        means_df  = st$means_df,
+        pvals_df  = st$pvals_df,
+        pal_treat = pal_treat,
+        ylab      = paste0("% ", mk, " high")
+      )
+      save_pdf(p_b, out_dir, paste0(mk, "_percentHigh.pdf"), width = 3, height = 2.5)
+
+      global_thr_list[[mk]] <- tibble(
+        Marker     = mk,
+        thr_scaled = fit$thr_scaled,
+        thr_ln     = fit$thr_ln
+      )
+    }
+  }
+
+  global_thr_df <- bind_rows(global_thr_list) %>%
+    mutate(
+      experiment = exp_label,
+      created    = format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+    )
+
+  write_csv(global_thr_df, file.path(out_dir, "global_thresholds_ln_scaled.csv"))
+
+  list(df = df, global_thresholds = global_thr_df)
+}
+
+df1 <- readRDS(rds_exp1)
+df2 <- readRDS(rds_exp2)
+
+# EXP1: only the three canonical markers
+res1 <- run_global_gmm_and_plots(
+  df               = df1,
+  exp_label        = "exp1",
+  out_dir          = file.path(out_root, "exp1"),
+  cellline_order   = order_exp1,
+  markers_requested = markers_exp1,
+  thr_ln_overrides = list()
+)
+
+# EXP2: run ALL available signals (anything with *_ln and *_scaled)
+# + force DNA threshold on ln scale (use your value)
+res2 <- run_global_gmm_and_plots(
+  df               = df2,
+  exp_label        = "exp2",
+  out_dir          = file.path(out_root, "exp2"),
+  cellline_order   = order_exp2,
+  markers_requested = markers_exp2,           # <- ALL inferred markers
+  thr_ln_overrides = list(DNA = 12.75) # <- your forced DNA threshold (edit if needed)
+)
+
+cat("Done.\n")
+cat("Exp1 outputs:", file.path(out_root, "exp1"), "\n")
+cat("Exp2 outputs:", file.path(out_root, "exp2"), "\n")
+
+
+```

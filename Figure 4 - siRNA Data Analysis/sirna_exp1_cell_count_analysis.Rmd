@@ -1,0 +1,58 @@
+
+```{r}
+suppressPackageStartupMessages({
+  library(dplyr)
+})
+
+source("cellcount_utils.R")
+
+set.seed(1)
+
+## ============================================================
+## Experiment 1: Plot normalized cell count from processed RDS
+## ============================================================
+
+out_dir <- file.path("manuscript_out", "exp1")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+## NOTE: you created this file earlier from the CSV merge + label swap
+rds_in <- file.path("cell_count_exp1.rds")
+if (!file.exists(rds_in)) stop("Missing file: ", rds_in)
+
+cell_counts_raw <- readRDS(rds_in)
+
+## Enforce ordering + treatment levels (safety)
+cellline_order_exp1 <- c("MALME3M", "UACC62", "LOXIMVI", "SKMEL28", "WM115")
+cell_counts_std <- standardize_cellcount_df(cell_counts_raw, cellline_order = cellline_order_exp1)
+
+## Add norm_pct if not already present
+cell_counts_norm <- if ("norm_pct" %in% names(cell_counts_std)) {
+  cell_counts_std
+} else {
+  normalize_cell_counts(cell_counts_std, baseline_treatment = "si-NTC")
+}
+
+## Summarize + plot
+pal_treat_cellcount <- c("si-NTC" = "#85D484", "si-CXXC1" = "#8770E0")
+
+summ <- summarise_norm_cell_counts(cell_counts_norm)
+
+p_norm_cells <- plot_norm_cellcount_bar(
+  means_df  = summ$means_df,
+  pvals_df  = summ$pvals_df,
+  pal_treat = pal_treat_cellcount,
+  ylab      = "% normalized cell count (vs si-NTC)",
+  y_max     = 120
+)
+
+save_pdf(p_norm_cells, out_dir, "norm_cell_count.pdf", width = 3, height = 2.5)
+
+## Optional: save the normalized version too (so future plotting is one-line)
+rds_norm_out <- file.path(out_dir, "cell_count_exp1_norm.rds")
+saveRDS(cell_counts_norm, rds_norm_out, compress = "xz")
+
+cat("Loaded RDS:", rds_in, "\n")
+cat("Saved normalized RDS:", rds_norm_out, "\n")
+cat("Saved plot:", file.path(out_dir, "norm_cell_count.pdf"), "\n")
+```
+

@@ -1,0 +1,61 @@
+```{r}
+## ============================================================
+## run_regressions_exp1.R
+## Experiment 1: Δ% regressions across markers and normalized cell count
+## ============================================================
+##
+## This script runs a regression suite using pre-computed RDS inputs:
+## - Marker %High means tables (from IF GMM threshold pipeline)
+## - Per-well normalized cell counts with norm_pct
+##
+## Inputs (expected)
+## - manuscript_out/exp1/CXXC1_percentHigh_means.rds
+## - manuscript_out/exp1/Ki67_percentHigh_means.rds
+## - manuscript_out/exp1/H3K4me3_percentHigh_means.rds
+## - manuscript_out/exp1/cell_count_exp1_norm.rds   (must contain norm_pct)
+##
+## Outputs
+## - manuscript_out/exp1/regressions/*.pdf
+## - manuscript_out/exp1/regressions/delta_summary_regression_input.csv
+## ============================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(broom)
+})
+
+source("regression_utils.R")
+
+set.seed(1)
+
+## ------------------------------------------------------------
+## Paths
+## ------------------------------------------------------------
+exp1_dir <- file.path("manuscript_out", "exp1")
+out_dir  <- file.path(exp1_dir, "regressions")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+rds_cxxc1_means <- file.path(exp1_dir, "CXXC1_percentHigh_means.rds")
+rds_ki67_means  <- file.path(exp1_dir, "Ki67_percentHigh_means.rds")
+rds_h3k4_means  <- file.path(exp1_dir, "H3K4me3_percentHigh_means.rds")
+rds_cellcount   <- file.path(exp1_dir, "cell_count_exp1_norm.rds")
+
+## ------------------------------------------------------------
+## Run suite
+## ------------------------------------------------------------
+res <- run_exp1_regression_suite(
+  rds_cxxc1_means = rds_cxxc1_means,
+  rds_ki67_means  = rds_ki67_means,
+  rds_h3k4_means  = rds_h3k4_means,
+  rds_cellcount   = rds_cellcount,
+  out_dir         = out_dir,
+  sensitive_lines = c("UACC62", "MALME3M", "LOXIMVI")
+)
+
+cat("Done.\n")
+cat("Regression outputs:", out_dir, "\n")
+cat("Regression input table:", file.path(out_dir, "delta_summary_regression_input.csv"), "\n")
+
+```
