@@ -1,0 +1,159 @@
+```{r}
+## ============================================================
+## make_density_scatters_from_rds.R
+## Jet-density scatter plots using density_scatter_utils.R
+##
+## Outputs:
+##   manuscript_out/density_scatter/exp1
+##   manuscript_out/density_scatter/exp2
+## ============================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(ggplot2)
+  library(stringr)
+  library(MASS)
+})
+
+source("density_scatter_utils.R")
+
+## ------------------------------------------------------------
+## Small helpers
+## ------------------------------------------------------------
+pick_treat_levels <- function(df) {
+  u <- unique(as.character(df$Treatment))
+
+  ntc_candidates <- c("si-NTC", "NTC", "siNTC", "control", "Ctrl")
+  kd_candidates  <- c("si-CXXC1", "siCXXC1", "CXXC1", "KD_CXXC1", "si_CXXC1")
+
+  ntc <- ntc_candidates[ntc_candidates %in% u][1]
+  kd  <- kd_candidates[kd_candidates %in% u][1]
+
+  c(ntc, kd)
+}
+
+## Override the KDE helper to drop non-finite values before kde2d()
+add_point_density <- function(df, x_col, y_col, n_grid = 200) {
+  df <- df %>%
+    dplyr::filter(is.finite(.data[[x_col]]), is.finite(.data[[y_col]]))
+
+  if (nrow(df) < 2) {
+    df$density <- NA_real_
+    return(df)
+  }
+
+  xv <- df[[x_col]]
+  yv <- df[[y_col]]
+
+  lims <- c(range(xv), range(yv))
+  kde  <- MASS::kde2d(xv, yv, n = n_grid, lims = lims)
+
+  ix <- findInterval(xv, kde$x, all.inside = TRUE)
+  iy <- findInterval(yv, kde$y, all.inside = TRUE)
+
+  df$density <- kde$z[cbind(ix, iy)]
+  df
+}
+
+## ------------------------------------------------------------
+## Inputs (same folder as this script)
+## ------------------------------------------------------------
+df_exp1 <- readRDS("single_cell_IF_5lines_exp1.rds")
+df_exp2 <- readRDS("single_cell_IF_3lines_exp2.rds")
+
+thr_exp1_csv <- "global_thresholds_ln_scaled_exp1.csv"
+thr_exp2_csv <- "global_thresholds_ln_scaled_exp2.csv"
+
+## ------------------------------------------------------------
+## Outputs
+## ------------------------------------------------------------
+out_exp1 <- file.path("manuscript_out", "density_scatter", "exp1")
+out_exp2 <- file.path("manuscript_out", "density_scatter", "exp2")
+dir.create(out_exp1, showWarnings = FALSE, recursive = TRUE)
+dir.create(out_exp2, showWarnings = FALSE, recursive = TRUE)
+
+## ------------------------------------------------------------
+## EXP1: CXXC1 vs H3K4me3, H3K4me3 vs Ki67
+##   - Fixed axes computed across ALL exp1 lines
+##   - Plots generated ONLY for: UACC62, MALME3M
+## ------------------------------------------------------------
+keep_lines_exp1 <- sort(unique(as.character(df_exp1$CellLine)))
+plot_lines_exp1 <- c("UACC62", "MALME3M")
+treat_levels_exp1 <- pick_treat_levels(df_exp1)
+
+pairs_exp1 <- list(
+  list(
+    x    = "CXXC1_ln",
+    y    = "H3K4me3_ln",
+    xlab = "CXXC1 ln(a.u.)",
+    ylab = "H3K4me3 ln(a.u.)",
+    stub = "CXXC1_vs_H3K4me3"
+  ),
+  list(
+    x    = "H3K4me3_ln",
+    y    = "Ki67_ln",
+    xlab = "H3K4me3 ln(a.u.)",
+    ylab = "Ki-67 ln(a.u.)",
+    stub = "H3K4me3_vs_Ki67"
+  )
+)
+
+run_save_jet_density_suite(
+  df             = df_exp1,
+  keep_lines     = keep_lines_exp1,
+  plot_lines     = plot_lines_exp1,
+  pairs          = pairs_exp1,
+  thresholds_csv = thr_exp1_csv,
+  out_dir        = out_exp1,
+  cap_n_scatter  = 1500L,
+  overrides_ln   = list(),
+  pad_frac       = 0.04,
+  treat_levels   = treat_levels_exp1
+)
+
+## ------------------------------------------------------------
+## EXP2:
+##   - H3K4me3 vs pRb Ser807/811
+##   - DNA content vs pRb Ser807/811
+##   - Fixed axes computed across ALL exp2 lines
+##   - Plots generated ONLY for: MALME3M
+## ------------------------------------------------------------
+keep_lines_exp2 <- sort(unique(as.character(df_exp2$CellLine)))
+plot_lines_exp2 <- c("MALME3M")
+treat_levels_exp2 <- pick_treat_levels(df_exp2)
+
+pairs_exp2 <- list(
+  list(
+    x    = "H3K4me3_ln",
+    y    = "pRb_807_811_ln",
+    xlab = "H3K4me3 ln(a.u.)",
+    ylab = "pRb Ser807/811 ln(a.u.)",
+    stub = "H3K4me3_vs_pRb807_811"
+  ),
+  list(
+    x    = "DNA_ln",
+    y    = "pRb_807_811_ln",
+    xlab = "DNA content ln(a.u.)",
+    ylab = "pRb Ser807/811 ln(a.u.)",
+    stub = "DNA_vs_pRb807_811"
+  )
+)
+
+run_save_jet_density_suite(
+  df             = df_exp2,
+  keep_lines     = keep_lines_exp2,
+  plot_lines     = plot_lines_exp2,
+  pairs          = pairs_exp2,
+  thresholds_csv = thr_exp2_csv,
+  out_dir        = out_exp2,
+  cap_n_scatter  = 1500L,
+  overrides_ln   = list(),
+  pad_frac       = 0.04,
+  treat_levels   = treat_levels_exp2
+)
+
+message("DONE. Saved to:\n  ", file.path("manuscript_out", "density_scatter"))
+
+
+```
